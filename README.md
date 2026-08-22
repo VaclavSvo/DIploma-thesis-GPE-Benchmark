@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # 3D GPE / Truncated-Wigner solver with vortex nucleation diagnostics
 
 Natural units (hbar = m = 1):
@@ -436,3 +437,7 @@ ground state 68 s; 1246 real-time steps in 866 s (1.4 steps/s); gates passed at
   collision velocity in a report.
 - **`tw_trapped_dipole` at N=384** is past its validated range — depletion is
   already 13% at N=256, over the gate. See the depletion table above.
+=======
+# DIploma-thesis-GPE-Benchmark
+Work on my diploma thesis, proof of concept working benchmark of 3D GPE solverwith Truncated Wigner 
+>>>>>>> eda765bd806c83b32eec7bb811a4a8d9ec45f1d1
