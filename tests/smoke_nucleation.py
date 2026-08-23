@@ -24,8 +24,11 @@ def _shrink(scenario: str, out_dir: str) -> None:
     """Override config in place: a real nucleation run is N=384 over T=8."""
     config.SCENARIO = scenario
     config.N, config.L = 32, 16.0
-    config.T_TOTAL = 0.4
-    config.NUCLEATION_FRAMES = 4
+    # T_TOTAL long enough that 4 frames fit inside T_TOTAL/dt at order 4 --
+    # otherwise the schedule caps at one snapshot per sub-step and the frame
+    # count below is not what was asked for.
+    config.T_TOTAL = 2.0
+    config.GIF_SECONDS, config.GIF_FPS = 0.4, 10   # -> 4 recorded frames
     config.N_TRAJECTORIES = 2 if scenario == "nucleation_collision" else 1
     config.BATCH_SIZE = 2
     config.OUT_DIR = out_dir
@@ -53,7 +56,7 @@ def _check_outputs(out_dir: str, scenario: str, expect_gif: bool = True) -> None
     # Detection runs every NUCLEATION_DETECT_STRIDE blocks, plus always on the
     # last one -- so the frame count follows from both, and the final block
     # must be present whatever the stride.
-    blocks = config.NUCLEATION_FRAMES - 1
+    blocks = round(config.GIF_SECONDS * config.GIF_FPS) - 1
     stride = config.NUCLEATION_DETECT_STRIDE
     expected = len({*range(0, blocks + 1, stride), blocks})
     assert len(times) == expected, (len(times), expected)

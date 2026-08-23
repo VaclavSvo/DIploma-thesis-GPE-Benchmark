@@ -11,6 +11,8 @@ README.md has the physics behind the calibrated numbers here (cutoff scaling
 and depletion, dt multipliers, what a nucleation count needs before it means
 anything).
 """
+from time import time
+
 import numpy as np
 
 from gpe3d.units import (derive_natural_units, velocity_to_natural,
@@ -47,6 +49,16 @@ SCENARIO = "nucleation_collision"
 #            "each cloud carries half the relative velocity" convention, and
 #            the /4 rows are kept as-is because their grid/velocity gate was
 #            tuned against them.
+# separation      (x,y,z) between the cloud centres. Half of it displaces each
+#            cloud, in opposite directions.
+# impact_offset   (x,y,z) impact parameter, split between the clouds the same
+#            way and added to `separation`. A component transverse to the kick
+#            makes the clouds shear past each other by that much rather than
+#            meeting head-on. (0,0,0) = head-on.
+#            ** A nonzero transverse offset breaks the symmetry by itself, so
+#            the mean-field control nucleates vortices too and the clean
+#            TW-vs-control A/B is lost. Useful as a "does anything happen"
+#            probe; not as the headline result. **
 OMEGA_REF_HZ = 4.57              # reference trap frequency, Hz (all Na-23 rows)
 ANISOTROPY = np.sqrt(8.0)        # omega_y = omega_z = omega_x / ANISOTROPY.
                                   # FLAGGED: the source paper has z as the TIGHT
@@ -62,14 +74,15 @@ _WIDE = (1.0, 1.0 / ANISOTROPY, 1.0 / ANISOTROPY)
 _NUCLEATION = dict(
     solver="collision", physical=True, omega=_WIDE,
     n_per_cloud=5.0e3, n_clouds=2.0,
-    v_rel_real=2.0e-3, v_split=2.0, separation=(8.0, 0.0, 0.0),
-    cutoff=3.0, cutoff_n_ref=128, cutoff_exponent=0.85, cutoff_nyquist_safety=3.0,
-    seed=54579554444758, order4_dt_multiplier=100.0,
-    batch_size=1,          # detection needs each trajectory's own field anyway
-    N=384, L=16.0,         # N=384 (dx=0.042) resolves cores better; 256 is the
+    v_rel_real=2.0e-3, v_split=2.0,
+    separation=(8.0, 0.0, 0.0), impact_offset=(0.0, 3.0, 0.0),
+    cutoff=3.0, cutoff_n_ref=96, cutoff_exponent=0.9, cutoff_nyquist_safety=3.0,
+    seed=int(time()), order4_dt_multiplier=200.0,
+    batch_size=2,          # detection needs each trajectory's own field anyway
+    N=320, L=24.0,         # N=384 (dx=0.042) resolves cores better; 256 is the
                             # quick look. run.py prints dx/xi, and the detector
                             # raises if the windings stop being integers.
-    t_total=5.0,           # the snake instability needs several xi/c_s AFTER
+    t_total=2.5,           # the snake instability needs several xi/c_s AFTER
                             # the clouds overlap; stopping at overlap shows
                             # fringes and no vortices, which reads as a null
                             # result but is just an early stop.
@@ -87,8 +100,9 @@ SCENARIOS = {
         solver="collision", tw=False, physical=True, omega=_WIDE,
         n_per_cloud=1.0e4,     # scaled down from the paper's ~1e6/cloud
         n_clouds=2.0, v_rel_real=4.0e-3, v_split=4.0,
-        separation=(8.0, 0.0, 0.0),   # not from the paper: just large enough
+        separation=(6.0, 0.0, 0.0),   # not from the paper: just large enough
                                        # that the clouds don't overlap at t=0
+        impact_offset=(0.0, 0.0, 0.0),   # head-on
         N=384, L=16.0, t_total=3.0),
 
     "tw_trapped_dipole": dict(
@@ -109,10 +123,11 @@ SCENARIOS = {
         n_clouds=4.0,          # FLAGGED: inconsistent with n_per_cloud (two
                                 # clouds), and depletion_fraction is measured
                                 # against it. The nucleation rows use 2.0.
-        v_rel_real=2.0e-3, v_split=4.0, separation=(8.0, 0.0, 0.0),
+        v_rel_real=2.0e-3, v_split=4.0,
+        separation=(6.0, 0.0, 0.0), impact_offset=(0.0, 0.0, 0.0),
         n_traj=4, batch_size=1,
         cutoff=3.0, cutoff_n_ref=128, cutoff_exponent=0.85, cutoff_nyquist_safety=3.0,
-        seed=54579597972457297527, order4_dt_multiplier=100.0,
+        seed=int(time()), order4_dt_multiplier=100.0,
         N=384, L=16.0, t_total=3.0),
 
     "tw_trapped_thermal": dict(
@@ -129,13 +144,13 @@ SCENARIOS = {
         cutoff=2.0, cutoff_n_ref=128,
         cutoff_exponent=0.5,   # 0.7 measured 10.23% depletion at N=256 (FAIL);
                                 # 0.5 gives 8.83% with real margin
-        cutoff_nyquist_safety=2.0, seed=0,
+        cutoff_nyquist_safety=2.0, seed=int(time()),
         order4_dt_multiplier=50.0,   # 400 passed the short sweep and then blew
                                       # up (24000% energy drift) on a full
                                       # T_TOTAL run -- see README
         N=256, L=10.0, t_total=3.0),
 
-    "nucleation_collision": dict(_NUCLEATION, tw=True, n_traj=8),
+    "nucleation_collision": dict(_NUCLEATION, tw=True, n_traj=8, batch_size=4),
     # 4 trajectories is fine for the conservation gates and useless for
     # nucleation statistics; 20-50 independent seeds for a real number.
 
@@ -154,7 +169,19 @@ SPLITSTEP_ORDER = 4     # 2 = Strang, O(dt^2). 4 = Yoshida, O(dt^4) at 3x the
                          # Set 2 for a direct A/B, or to rule the integrator out.
 TOL = 0.01              # pass/fail tolerance on the conserved quantities
 SAVE_GIF = True         # mid-plane density-slice animation (non-nucleation runs)
-GIF_FPS = 60            # frame count is chosen so playback length == T_TOTAL
+
+# Movie length is set here, independently of how much physical time the run
+# covers: GIF_SECONDS of playback at GIF_FPS needs GIF_SECONDS*GIF_FPS frames,
+# whether those depict T_TOTAL=1 or T_TOTAL=8. run.py derives the snapshot
+# cadence from this and reports it before evolving.
+#
+# The ceiling is one snapshot per sub-step -- the solver only has T_TOTAL/dt
+# distinct states to show. Ask for more and run.py records every state it has
+# and the renderer cross-fades the rest up to GIF_FPS, so the movie still runs
+# GIF_SECONDS long; it just carries fewer genuinely independent frames. run.py
+# prints how many of the frames are real when that happens.
+GIF_SECONDS = 4.0       # playback length of every movie, in real seconds
+GIF_FPS = 60            # playback frame rate
 SNAPSHOT_ROWS = 3       # report frames when SAVE_GIF is False (3 * this)
 OUT_DIR = "outputs"
 VERBOSE = True
@@ -168,8 +195,8 @@ N, L, T_TOTAL = _S["N"], _S["L"], _S["t_total"]
 OMEGA = _S["omega"]
 N_TRAJECTORIES = _S.get("n_traj", 1)
 BATCH_SIZE = _S.get("batch_size", 1)
-INITIAL_OFFSET = _S.get("initial_offset", (10.0, 0.0, 0.0))
-INITIAL_VELOCITY = _S.get("initial_velocity", (4.0, 0.0, 0.0))
+INITIAL_OFFSET = _S.get("initial_offset", (0.0, 0.0, 0.0))
+INITIAL_VELOCITY = _S.get("initial_velocity", (0.0, 0.0, 0.0))
 
 if _S["physical"]:
     units = derive_natural_units(NA23_ATOM_MASS_U, NA23_SCATTERING_LENGTH_M, OMEGA_REF_HZ)
@@ -184,14 +211,16 @@ if _S["solver"] == "collision":
     N_PER_CONDENSATE = _S["n_per_cloud"]
     N_PARTICLES = _S["n_clouds"] * N_PER_CONDENSATE
     COLLISION_SEPARATION = _S["separation"]
+    COLLISION_IMPACT_OFFSET = _S.get("impact_offset", (0.0, 0.0, 0.0))
     COLLISION_HALF_VELOCITY = (
         velocity_to_natural(_S["v_rel_real"], units) / _S["v_split"], 0.0, 0.0)
     SOLVER_PARAMS.update(n_particles_per_cloud=N_PER_CONDENSATE,
                           separation=COLLISION_SEPARATION,
+                          impact_offset=COLLISION_IMPACT_OFFSET,
                           half_velocity=COLLISION_HALF_VELOCITY)
 else:
     N_PARTICLES = _S["n_particles"]
-    COLLISION_HALF_VELOCITY = (0.0, 0.0, 0.0)
+    COLLISION_HALF_VELOCITY = COLLISION_IMPACT_OFFSET = (0.0, 0.0, 0.0)
     SOLVER_PARAMS.update(initial_offset=INITIAL_OFFSET,
                           initial_velocity=INITIAL_VELOCITY)
 SOLVER_PARAMS["n_particles"] = N_PARTICLES
@@ -247,18 +276,17 @@ NUCLEATION_CLOSE_CUTOFF_DX = 2.5   # traced ends this close -> a closed ring
 # Recording cadence. Detection is three full-grid winding sweeps per trajectory
 # per frame; a slice is two 2D planes pulled off the GPU. So record slices
 # densely and detect sparsely, rather than tying both to one number.
-NUCLEATION_FRAMES = 120        # recorded frames per run, and the movie's time
-                                # resolution -- rendering cross-fades these up
-                                # to NUCLEATION_GIF_FPS. Past ~200 this mostly
-                                # buys memory pressure, not smoothness.
-NUCLEATION_DETECT_STRIDE = 2   # detect every N-th frame
+NUCLEATION_DETECT_STRIDE = 1   # detect every N-th recorded frame. This, not the
+                                # frame count, is the cost knob for a nucleation
+                                # run: a slice is two 2D planes off the GPU, a
+                                # detection is three full-grid winding sweeps per
+                                # trajectory. run.py prints both counts.
 NUCLEATION_SLICE_STRIDE = 1    # record a movie frame every N-th frame
 NUCLEATION_SLICE_PLANES = ("x", "y", "z")   # one figure column per plane
 NUCLEATION_SLICE_TRAJECTORY = 0   # which trajectory the movie follows. Never an
                                    # ensemble average: vortices nucleate in
                                    # different places in every trajectory, so
                                    # averaging is exactly what erases them.
-NUCLEATION_GIF_FPS = 60        # playback rate of both movies (length = T_TOTAL)
 NUCLEATION_VORTEX_MAP = True   # also write vortex_map.gif from pierce_points.npz
                                 # -- no GPU time, re-renderable afterwards, and
                                 # the view that stays readable once a tangle has

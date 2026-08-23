@@ -36,7 +36,7 @@ NEGATIVE_COLOUR = "#4a86e0"
 # Frame-rate helpers
 # ---------------------------------------------------------------------------
 
-def sub_frames_for(n_recorded: int, fps: int, duration: float) -> int:
+def sub_frames_for(n_recorded: int, fps: float, duration: float) -> int:
     """How many render frames per recorded frame to hit `fps` over `duration`
     seconds of playback."""
     if n_recorded < 2:

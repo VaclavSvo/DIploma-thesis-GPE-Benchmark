@@ -83,22 +83,45 @@ def _section(title: str) -> None:
     print(f"\n-- {title} --")
 
 
-def _block_schedule(dt: float, nucleate: bool) -> tuple[int, int, int]:
-    """(n_blocks, steps_per_block, total_steps).
+def _frame_schedule(dt: float, want_movie: bool) -> dict:
+    """How many snapshots to record, and the block schedule producing them.
 
-    A nucleation run sets its frame count explicitly: detection costs three
-    full-grid winding sweeps per trajectory per frame, so inheriting the gif's
-    playback rate would spend more time detecting than evolving. Otherwise one
-    frame per 1/GIF_FPS of *simulated* time, which makes the gif play at 1x.
+    Movie length is decoupled from simulated time: GIF_SECONDS of playback at
+    GIF_FPS needs GIF_SECONDS*GIF_FPS frames regardless of T_TOTAL. Those
+    frames are spread evenly over T_TOTAL, so a snapshot lands every
+    T_TOTAL/(frames-1) of simulated time.
+
+    The ceiling is one snapshot per sub-step: the run only passes through
+    T_TOTAL/dt distinct states, so that is the most it can ever show. Asking
+    for more records every state there is and leaves the rest to the
+    renderer's cross-fade, which keeps the movie GIF_SECONDS long but with
+    fewer genuinely independent frames.
+
+    Returns the schedule plus what it took to get there, so main() can report
+    it rather than leaving the user to infer it.
     """
-    if nucleate:
-        n_blocks = max(2, int(getattr(config, "NUCLEATION_FRAMES", 60))) - 1
-    elif config.SAVE_GIF:
-        n_blocks = max(2, round(config.T_TOTAL * config.GIF_FPS)) - 1
+    # ceil, so the run never covers less physical time than T_TOTAL.
+    substeps = max(1, math.ceil(config.T_TOTAL / dt))
+
+    if want_movie:
+        frames_wanted = max(2, round(config.GIF_SECONDS * config.GIF_FPS))
+        frames = max(2, min(frames_wanted, substeps + 1))  # one per sub-step, at most
     else:
-        n_blocks = max(1, 3 * config.SNAPSHOT_ROWS - 1)
-    steps_per_block = max(1, round(config.T_TOTAL / dt / n_blocks))
-    return n_blocks, steps_per_block, steps_per_block * n_blocks
+        frames_wanted = frames = max(2, 3 * config.SNAPSHOT_ROWS)
+
+    n_blocks = frames - 1
+    # ceil again: rounding this DOWN would execute fewer sub-steps than
+    # T_TOTAL/dt and end the run short of T_TOTAL without saying so.
+    steps_per_block = max(1, -(-substeps // n_blocks))
+    total_steps = steps_per_block * n_blocks
+    # total_steps*dt overshoots T_TOTAL by up to one block, so shrink dt onto
+    # the grid instead. choose_dt's dt is an accuracy ceiling, so a slightly
+    # smaller step is always safe, and this makes the run land exactly on
+    # T_TOTAL with exactly equidistant frames.
+    return dict(n_blocks=n_blocks, steps_per_block=steps_per_block,
+                total_steps=total_steps, dt=config.T_TOTAL / total_steps,
+                frames=frames, frames_wanted=frames_wanted,
+                capped=frames < frames_wanted)
 
 
 def main():
@@ -132,8 +155,13 @@ def main():
     print(solver.units())
     print(f"ground state prepared in {time.time() - t0:.2f}s")
 
-    dt = solver.engine.dt
-    n_blocks, steps_per_block, total_steps = _block_schedule(dt, nucleate)
+    dt_accuracy = solver.engine.dt
+    sched = _frame_schedule(dt_accuracy, want_movie=config.SAVE_GIF or nucleate)
+    n_blocks = sched["n_blocks"]
+    steps_per_block = sched["steps_per_block"]
+    total_steps = sched["total_steps"]
+    dt = sched["dt"]
+    solver.engine.set_dt(dt, order=config.SPLITSTEP_ORDER)
 
     if _spec()['tw']:
         _section("TW ensemble")
@@ -143,7 +171,23 @@ def main():
         print(f"n_traj={config.N_TRAJECTORIES}   batch_size={config.BATCH_SIZE}")
     else:
         _section("Evolution setup")
-    print(f"dt={dt:.4e}   total_steps={total_steps}   n_blocks={n_blocks}")
+    print(f"dt={dt:.4e} (accuracy limit {dt_accuracy:.4e}, shrunk onto {total_steps} whole "
+          f"steps)   total_steps={total_steps}   n_blocks={n_blocks}")
+
+    if config.SAVE_GIF or nucleate:
+        _section("Movie schedule")
+        print(f"{config.GIF_SECONDS:g}s at {config.GIF_FPS}fps = {sched['frames_wanted']} frames, "
+              f"showing T_TOTAL={config.T_TOTAL:g} of simulated time "
+              f"({config.T_TOTAL / config.GIF_SECONDS:.3g}x speed)")
+        print(f"recording {sched['frames']} snapshots, one every {steps_per_block} of the "
+              f"{total_steps} computed sub-steps (dt_frame={steps_per_block * dt:.4e}, "
+              f"last frame at t={total_steps * dt:g})")
+        if sched["capped"]:
+            print(f"NOTE: only {sched['frames']} distinct states exist at this dt "
+                  f"(T_TOTAL/dt = {int(config.T_TOTAL / dt)} sub-steps) -- the renderer "
+                  f"cross-fades them up to {sched['frames_wanted']}, so the movie still runs "
+                  f"{config.GIF_SECONDS:g}s but only {sched['frames']} frames carry new data. "
+                  f"Lower SPLITSTEP_ORDER to 2, or shorten GIF_SECONDS, for more real frames.")
 
     # Vortex detection rides along with the evolution: it needs each
     # trajectory's own psi, which only exists inside the loop. The ensemble
@@ -160,6 +204,10 @@ def main():
         print(f"link cutoff: {detector_cfg.link_cutoff_dx:g} dx   "
               f"movie planes: {','.join(detector_cfg.slice_planes)} "
               f"(trajectory {detector_cfg.slice_trajectory})")
+        n_detect = len({*range(0, n_blocks + 1, detector_cfg.detect_stride), n_blocks})
+        print(f"detecting on {n_detect}/{n_blocks + 1} recorded frames "
+              f"(stride {detector_cfg.detect_stride}) x {config.N_TRAJECTORIES} trajectories "
+              f"= {n_detect * config.N_TRAJECTORIES} detections")
         psi_ref = solver.psi_mean if _spec()['tw'] else state.psi
         res = nucleation_runner.resolution_note(
             solver.engine, config.G, float(solver.engine._density(psi_ref).max()))
@@ -223,28 +271,39 @@ def main():
         )
         paths = nucleation_runner.write_outputs(
             observer, os.path.join(config.OUT_DIR, config.SCENARIO), meta,
-            gif_fps=getattr(config, "NUCLEATION_GIF_FPS", 60),
+            gif_fps=config.GIF_FPS,
             box_extent=(-config.L / 2.0, config.L / 2.0),
-            duration=config.T_TOTAL,   # 1x playback, same rule as the other gifs
+            duration=config.GIF_SECONDS,
             vortex_map=getattr(config, "NUCLEATION_VORTEX_MAP", True))
         for name, path in paths.items():
             print(f"saved {name}: {path}")
     elif config.SAVE_GIF:
         _section("Output")
         gif_path = os.path.join(config.OUT_DIR, "density_slice.gif")
-        _save_gif(densities, history["t"], gif_path, config.GIF_FPS)
-        print(f"saved {gif_path}  ({len(densities)} frames @ {config.GIF_FPS}fps "
-              f"= {len(densities) / config.GIF_FPS:.2f}s, sim T_TOTAL={config.T_TOTAL:.2f}s)")
+        n_rendered = _save_gif(densities, history["t"], gif_path,
+                                config.GIF_FPS, config.GIF_SECONDS)
+        print(f"saved {gif_path}  ({len(densities)} recorded -> {n_rendered} rendered frames "
+              f"@ {config.GIF_FPS}fps = {n_rendered / config.GIF_FPS:.2f}s, "
+              f"sim T_TOTAL={config.T_TOTAL:g})")
 
     solver.engine.free()
     return all(r.passed for r in results) and depletion_ok
 
 
-def _save_gif(densities, times, path, fps):
+def _save_gif(densities, times, path, fps, duration):
+    """Mid-plane density movie, `duration` seconds long at `fps`. Uses the same
+    frame-rate helpers and the same writer as the nucleation movies, so all
+    three obey GIF_SECONDS/GIF_FPS identically and all three get ffmpeg's
+    accurate frame timing when it is installed."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.animation as animation
+    from nucleation.visualise import interpolate_frames, save_animation, sub_frames_for
+
+    sub = sub_frames_for(len(densities), fps, duration)
+    densities = interpolate_frames(densities, sub)
+    times = interpolate_frames(times, sub)
 
     vmax = max(d.max() for d in densities)
     fig, ax = plt.subplots(figsize=(5, 5))
@@ -257,8 +316,8 @@ def _save_gif(densities, times, path, fps):
         return im, title
 
     anim = animation.FuncAnimation(fig, update, frames=len(densities), interval=1000.0 / fps)
-    anim.save(path, writer=animation.PillowWriter(fps=fps))
-    plt.close(fig)
+    save_animation(anim, fig, path, fps, dpi=100)
+    return len(densities)
 
 
 if __name__ == "__main__":

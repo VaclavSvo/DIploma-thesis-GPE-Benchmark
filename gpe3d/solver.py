@@ -95,7 +95,16 @@ def two_cloud_collision_psi(engine, single_cloud_psi, params: dict):
     in whether noise is added afterwards.
 
     params:
-      separation             (dx,dy,dz) between cloud centres, default (3,0,0)
+      separation             (dx,dy,dz) between cloud centres, default (3,0,0).
+                             Along the kick axis this is the head-on gap.
+      impact_offset          (dx,dy,dz) impact parameter, default (0,0,0). Added
+                             on top of `separation` the same way -- half to each
+                             cloud, opposite signs -- so a component transverse
+                             to half_velocity makes the clouds shear past each
+                             other by that much instead of meeting head-on.
+                             Separate from `separation` only to keep "how far
+                             apart" and "by how much they miss" independently
+                             sweepable; the two add.
       half_velocity          each cloud's COM-frame velocity, default (1,0,0);
                              the clouds close in at twice this
       n_particles            total atoms in both clouds, default
@@ -103,9 +112,11 @@ def two_cloud_collision_psi(engine, single_cloud_psi, params: dict):
       n_particles_per_cloud  only used for that default
     """
     sep = params.get("separation", (3.0, 0.0, 0.0))
+    impact = params.get("impact_offset", (0.0, 0.0, 0.0))
     half_v = params.get("half_velocity", (1.0, 0.0, 0.0))
-    offset_plus = tuple(0.5 * s for s in sep)
-    offset_minus = tuple(-0.5 * s for s in sep)
+    displacement = tuple(s + i for s, i in zip(sep, impact))
+    offset_plus = tuple(0.5 * d for d in displacement)
+    offset_minus = tuple(-0.5 * d for d in displacement)
     v_plus = tuple(-v for v in half_v)   # cloud at +offset moves in -direction
     v_minus = tuple(v for v in half_v)   # cloud at -offset moves in +direction
 

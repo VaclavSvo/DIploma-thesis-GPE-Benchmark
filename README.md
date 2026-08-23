@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # 3D GPE / Truncated-Wigner solver with vortex nucleation diagnostics
 
 Natural units (hbar = m = 1):
@@ -71,6 +70,70 @@ The paper's numbers were extracted by an automated summariser, not by a careful
 manual read. Treat the scattering length, the trap anisotropy convention and the
 interaction prefactor as "best effort, cross-check yourself"; the atom number,
 reference trap frequency and collision velocity are more directly stated.
+
+## Movie length
+
+Movie length is set by `GIF_SECONDS` and `GIF_FPS` and is completely independent
+of how much physical time the run covers. `run.py` works out the snapshot cadence
+and reports it before evolving:
+
+```
+dt=1.3966e-03 (accuracy limit 1.5656e-03, shrunk onto 716 whole steps)  total_steps=716
+-- Movie schedule --
+6s at 30fps = 180 frames, showing T_TOTAL=1 of simulated time (0.167x speed)
+recording 180 snapshots, one every 4 of the 716 computed sub-steps
+(dt_frame=5.5866e-03, last frame at t=1)
+```
+
+Every sub-step is computed as usual; the recorder samples 180 of them. Frame
+count follows the movie, never the physics — the same settings against
+`T_TOTAL = 8` sample the same 180 snapshots out of 5191 sub-steps, at 1.33x
+speed instead of 0.167x.
+
+**dt is shrunk onto the frame grid.** `choose_dt` returns an accuracy *ceiling*,
+and `T_TOTAL/dt` is generally not divisible by the number of frames. Rather than
+rounding the steps-per-frame — which rounds *down* to 1 whenever the ratio is
+under 1.5, silently ending the run short of `T_TOTAL` (a T=1 run at dt=3.7e-3
+asked for 180 frames used to stop at t=0.669, a third short, and report success)
+— the schedule rounds steps-per-frame up and then sets `dt = T_TOTAL/total_steps`.
+That is always at or below the accuracy ceiling, lands the last frame exactly on
+`T_TOTAL`, and makes the frames exactly equidistant in sub-steps.
+
+**The ceiling is one snapshot per sub-step.** The run only passes through
+`T_TOTAL/dt` distinct states, so that is the most any movie can show. Ask for
+more and `run.py` records every state there is and says so:
+
+```
+NOTE: only 57 distinct states exist at this dt (T_TOTAL/dt = 56 sub-steps) --
+the renderer cross-fades them up to 180, so the movie still runs 6s but only 57
+frames carry new data. Lower SPLITSTEP_ORDER to 2, or shorten GIF_SECONDS, for
+more real frames.
+```
+
+This bites hardest at `SPLITSTEP_ORDER = 4`, where the whole point of the Yoshida
+composition is a much larger `dt` — a short run can genuinely have fewer sub-steps
+than the frames you asked for. Order 2 takes far smaller steps and gives many more
+distinct states to show, at the cost of wall-clock.
+
+Cross-fading is a blend, not a physical interpolation: every frame carrying real
+data is a recorded one, and the ones between exist so the eye can follow a feature
+instead of watching it teleport.
+
+Timing accuracy: all three movies go through ffmpeg when it is installed, which
+writes exact frame delays. Without it the Pillow fallback quantises each delay to
+a whole centisecond, so rates that do not divide 100 (30 fps among them) come out
+a few percent off the requested length. Install ffmpeg, or use 10/20/25/50 fps, if
+the exact duration matters.
+
+For a nucleation run the frame count is *not* the cost driver — detection is, at
+three full-grid winding sweeps per trajectory per frame. `NUCLEATION_DETECT_STRIDE`
+decouples the two: record slices densely for a smooth movie, detect on a subset.
+`run.py` prints both counts:
+
+```
+detecting on 31/180 recorded frames (stride 6) x 4 trajectories = 124 detections
+```
+
 
 ## Correctness notes worth knowing
 
@@ -286,12 +349,10 @@ Everything lands in `outputs/<scenario>/`:
 | `pierce_points.npz` | every core's `(x, y, z, charge, plane)`, ~kB/frame |
 | `run_metadata.json` | every knob that could change the answer, next to the answer |
 
-Both movies play at 1x (playback length = `T_TOTAL`) at `NUCLEATION_GIF_FPS`. The
-detector cannot run 60 times a second — it is three full-grid winding sweeps per
-trajectory per frame — so recorded frames are cross-faded up to the target rate at
-render time. Every frame carrying real data is a recorded one. The winding panels
-are *not* blended: a half-integer winding is meaningless, so the nearest recorded
-frame is held.
+Both movies obey `GIF_SECONDS` / `GIF_FPS` like every other output — see
+[Movie length](#movie-length). The winding panels are *not* cross-faded: a
+half-integer winding is meaningless, so the nearest recorded frame is held, and
+cores step while the density flows.
 
 `vortex_map.gif` needs only `pierce_points.npz`, so any finished run re-renders
 afterwards — different frame rate, different views, no GPU:
@@ -344,9 +405,12 @@ the kick, so the scan fails loudly rather than aliasing silently. And check
 run that stops at overlap shows fringes and no vortices, which reads as a null
 result but is just an early stop.
 
-An offset collision (`separation=(6.0, 1.5, 0.0)`) shears the clouds past each
-other and nucleates lines rather than rings, more robustly — but the offset breaks
-the symmetry by itself, so the mean-field control nucleates too and the clean A/B
+An offset collision — `impact_offset=(0.0, 1.5, 0.0)` in the scenario row — shears
+the clouds past each other and nucleates lines rather than rings, more robustly.
+The vector is split half to each cloud in opposite directions and added to
+`separation`, so a component transverse to the kick is the impact parameter and a
+component along it just widens the head-on gap. But the offset breaks the symmetry
+by itself, so the mean-field control nucleates too and the clean TW-vs-control A/B
 is lost. A first "does anything happen" shot, not a headline result.
 
 ## Tests
@@ -437,7 +501,3 @@ ground state 68 s; 1246 real-time steps in 866 s (1.4 steps/s); gates passed at
   collision velocity in a report.
 - **`tw_trapped_dipole` at N=384** is past its validated range — depletion is
   already 13% at N=256, over the gate. See the depletion table above.
-=======
-# DIploma-thesis-GPE-Benchmark
-Work on my diploma thesis, proof of concept working benchmark of 3D GPE solverwith Truncated Wigner 
->>>>>>> eda765bd806c83b32eec7bb811a4a8d9ec45f1d1
