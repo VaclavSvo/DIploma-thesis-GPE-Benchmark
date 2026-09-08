@@ -14,6 +14,7 @@ import time
 
 import config
 from gpe3d.backend import HAS_GPU, check_fft_grid_size
+from gpe3d.physics import grid_spacing
 from gpe3d.solver import ClassicalTrappedGPESolver, CollidingCondensatesSolver
 from gpe3d.tw_solver import TWTrappedGPESolver, TWCollidingCondensatesSolver
 from gpe3d import evolve, ensemble, gates
@@ -126,20 +127,24 @@ def _frame_schedule(dt: float, want_movie: bool) -> dict:
 
 def main():
     nucleate = config.SCENARIO in NUCLEATION_SCENARIOS
-    dx = config.L / config.N
+    # grid_spacing(), not L/N: the engine's grid keeps both endpoints, so
+    # dx = L/(N-1). Using L/N here overstated the Nyquist wavenumber pi/dx by
+    # N/(N-1) and made the aliasing gate below that much too generous.
+    dx = grid_spacing(config.N, config.L)
 
     _section("Setup")
     print(f"scenario: {config.SCENARIO}   backend: {'CuPy (GPU)' if HAS_GPU else 'NumPy (CPU)'}   "
           f"splitstep_order: {config.SPLITSTEP_ORDER}")
-    print(f"grid: N={config.N}  (N^3={config.N ** 3:,} points)   L={config.L}   dx={dx:.4e}")
+    print(f"grid: N={config.N}  (N^3={config.N ** 3:,} points)   L={config.L}   dx={dx:.4e}"
+          f"   (FFT box N*dx={config.N * dx:.4f})")
     check_fft_grid_size(config.N)  # perf warning only
 
     # Pre-flight, before the (possibly slow) ground-state prep.
     k_char = characteristic_velocity()
     if k_char > 0:
-        res = gates.resolution_gate("velocity_resolution", k_char, math.pi / dx)
-        print(f"[{'PASS' if res.passed else 'FAIL'}] {res.name}: {res.detail}")
-        if not res.passed:
+        res_gate = gates.resolution_gate("velocity_resolution", k_char, math.pi / dx)
+        print(f"[{'PASS' if res_gate.passed else 'FAIL'}] {res_gate.name}: {res_gate.detail}")
+        if not res_gate.passed:
             print("ABORTING before building the ground state -- raise N or lower L in "
                   "config.py, then rerun.")
             return False
@@ -209,7 +214,7 @@ def main():
               f"(stride {detector_cfg.detect_stride}) x {config.N_TRAJECTORIES} trajectories "
               f"= {n_detect * config.N_TRAJECTORIES} detections")
         psi_ref = solver.psi_mean if _spec()['tw'] else state.psi
-        res = nucleation_runner.resolution_note(
+        res = nucleation_runner.resolution_note(   # reused by the metadata below
             solver.engine, config.G, float(solver.engine._density(psi_ref).max()))
         print(f"healing length xi={res['healing_length']:.4g}   dx/xi={res['dx_over_xi']:.3g} "
               f"-- {'cores resolved' if res['resolved'] else 'WARNING: dx > xi/3, cores under-resolved'}")
@@ -259,15 +264,36 @@ def main():
         _section("Vortices")
         print(nucleation_runner.report(observer))
         _section("Output")
+        # Every knob that could change the answer, next to the answer. The
+        # noise seed and cutoff row belong here as much as the detector does:
+        # without the seed a TW run cannot be reproduced at all, and several
+        # scenarios seed from the clock.
         meta = dict(
             scenario=config.SCENARIO, N=config.N, L=config.L, dx=solver.engine.dx,
+            fft_box=config.N * solver.engine.dx,
             g=config.G, omega=config.OMEGA, T_TOTAL=config.T_TOTAL, dt=dt,
+            dt_accuracy_limit=dt_accuracy,
             n_blocks=n_blocks, steps_per_block=steps_per_block,
+            n_particles=config.N_PARTICLES,
             n_trajectories=config.N_TRAJECTORIES if _spec()['tw'] else 1,
+            batch_size=config.BATCH_SIZE,
             splitstep_order=config.SPLITSTEP_ORDER,
+            order4_dt_multiplier=_spec().get("order4_dt_multiplier"),
+            tw=_spec()['tw'],
+            seed=_spec().get("seed"),
+            cutoff_multiplier=_spec().get("cutoff"),
+            cutoff_n_ref=_spec().get("cutoff_n_ref"),
+            cutoff_exponent=_spec().get("cutoff_exponent"),
+            cutoff_nyquist_safety=_spec().get("cutoff_nyquist_safety"),
+            effective_cutoff_multiplier=getattr(solver, "effective_cutoff_multiplier", None),
+            n_cutoff_modes=getattr(solver, "n_cutoff_modes", None),
+            temperature_natural=getattr(solver, "temperature_natural", 0.0),
+            separation=_spec().get("separation"),
+            impact_offset=_spec().get("impact_offset"),
+            half_velocity=config.COLLISION_HALF_VELOCITY,
+            healing_length=res["healing_length"], dx_over_xi=res["dx_over_xi"],
             detector=dataclasses.asdict(detector_cfg),
             depletion_fraction=(history["phys_depletion_fraction"][-1] if _spec()['tw'] else 0.0),
-            effective_cutoff_multiplier=getattr(solver, "effective_cutoff_multiplier", None),
         )
         paths = nucleation_runner.write_outputs(
             observer, os.path.join(config.OUT_DIR, config.SCENARIO), meta,

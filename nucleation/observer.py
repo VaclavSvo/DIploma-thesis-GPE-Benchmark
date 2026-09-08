@@ -68,19 +68,44 @@ class NucleationObserver:
 
         follow = self.cfg.slice_trajectory - traj_offset
         if (0 <= follow < batch.shape[0]) and block_idx % self.cfg.slice_stride == 0:
-            self._record_slices(batch[follow], state.t)
+            # n_peak must be the FOLLOWED TRAJECTORY'S 3D peak, the same
+            # reference detect_frame() masks against -- see _record_slices.
+            # Reuse it from this block's detection when there was one.
+            n_peak = None
+            for f in reversed(self.frames):
+                if f.t == state.t and f.trajectory == self.cfg.slice_trajectory:
+                    n_peak = f.n_peak
+                    break
+            if n_peak is None:
+                # max(dens - c) == max(dens) - c, so the offset needs no
+                # full-grid subtraction of its own.
+                n_peak = float(xp.max(self.engine._density(batch[follow]))) - self.density_offset
+            self._record_slices(batch[follow], state.t, n_peak)
 
     # -- movie slices -------------------------------------------------------
-    def _record_slices(self, psi_traj, t: float) -> None:
-        """Density and winding on each requested plane, masked the same way
-        the counter masks.
+    def _record_slices(self, psi_traj, t: float, n_peak: float) -> None:
+        """Density and winding on each requested plane, masked against the
+        same threshold the counter uses.
 
         The masking is not cosmetic. An unmasked winding panel lights up
         wherever the density is near zero -- the phase there is numerical
         noise, and in a TW run it is genuine vacuum noise -- so the picture
         would show cores the count does not include, and the two outputs of
-        the same run would disagree. Same threshold, same closing, same
-        plaquette rule as nucleation/detect.py, applied in 2D.
+        the same run would disagree.
+
+        `n_peak` is therefore the trajectory's 3D peak density, passed in by
+        on_frame(). It used to be this plane's own max, which is a different
+        (smaller) number on every plane that does not cut the densest part of
+        the cloud -- so the panel's threshold was mask_threshold * n_peak_plane
+        rather than mask_threshold * n_peak_volume, i.e. strictly more
+        permissive than the counter exactly where the cloud is thin.
+
+        What still differs, deliberately: the counter also requires a 3D local
+        density dip (cfg.require_density_dip), which has no 2D equivalent that
+        is the same criterion rather than a new one. The panel is therefore an
+        UPPER BOUND on what the counter accepts -- a ringed core in the movie
+        may have failed the dip test in 3D. The count in observables.csv is
+        the number, the panel is where it is happening.
         """
         self.times.append(float(t))
         cfg = self.cfg
@@ -89,7 +114,7 @@ class NucleationObserver:
             dens2d = self.engine._density(psi2d) - self.density_offset
             axes = W.slice_axes(normal)
 
-            mask = W.density_mask(dens2d, float(xp.max(dens2d)), cfg.mask_threshold,
+            mask = W.density_mask(dens2d, n_peak, cfg.mask_threshold,
                                   cfg.mask_close_passes, axes=axes)
             w2d = xp.rint(W.winding_slice(psi2d, normal))
             w2d = xp.where(W.plaquette_mask(mask, *axes), w2d, 0)

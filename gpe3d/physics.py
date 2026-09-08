@@ -9,7 +9,9 @@ psi is (N,N,N) for one trajectory or (B,N,N,N) for a batch of Truncated-
 Wigner trajectories; every FFT passes axes=_FFT_AXES so only the last three
 axes are ever transformed.
 """
-from .backend import xp, HAS_GPU, fftn, ifftn
+import numpy as np
+
+from .backend import xp, HAS_GPU, fftn, ifftn, to_numpy
 
 _FFT_AXES = (-3, -2, -1)
 
@@ -28,6 +30,25 @@ else:
 # here since exp(-1j*tau*(...)) stays unitary for tau < 0.
 _YOSHIDA_THETA = 1.0 / (2.0 - 2.0 ** (1.0 / 3.0))
 _YOSHIDA_MID = 1.0 - 2.0 * _YOSHIDA_THETA
+
+
+def grid_spacing(N: int, L: float) -> float:
+    """The grid spacing GPEPhysics3D actually uses, dx = L/(N-1).
+
+    The grid is linspace(-L/2, +L/2, N) with BOTH endpoints kept, so it is
+    symmetric under r -> -r (nice for a symmetric trap) but its N points are
+    spaced L/(N-1), not L/N. Everything downstream is built from dx and is
+    therefore self-consistent -- the FFT's periodic box is N*dx = L*N/(N-1),
+    a fraction 1/(N-1) larger than the nominal L (0.4% at N=250).
+
+    Exposed so callers that need dx BEFORE an engine exists (run.py's
+    pre-flight resolution gate) cannot drift from the engine's own value:
+    using L/N there overstates the Nyquist wavenumber pi/dx by N/(N-1) and
+    makes the aliasing gate that much too generous.
+    """
+    if N < 2:
+        raise ValueError(f"grid_spacing: need N >= 2, got {N}")
+    return L / (N - 1)
 
 
 class GPEPhysics3D:
@@ -50,7 +71,11 @@ class GPEPhysics3D:
         # of the memory (~600MB saved at N=256). K_sq genuinely mixes all
         # three axes and is used every substep, so it stays dense.
         x = xp.linspace(-self.L / 2, self.L / 2, self.N, dtype=xp.float32)
-        self.dx = float(x[1] - x[0])
+        # dx from the exact L/(N-1), not from float32 x[1]-x[0]: the latter is
+        # one rounded difference of two rounded float32s and came out ~4e-6
+        # relative off the spacing it is meant to describe, which then went
+        # into dV (3x that), into every norm and energy, and into the k grid.
+        self.dx = grid_spacing(self.N, self.L)
         self.dV = self.dx ** 3
         self.Z = x.reshape(self.N, 1, 1)
         self.Y = x.reshape(1, self.N, 1)
@@ -208,6 +233,17 @@ class GPEPhysics3D:
 
     # -- Real-time propagation ----------------------------------------------
     def run_block(self, n_steps: int) -> None:
+        """Advance psi by exactly n_steps sub-steps.
+
+        n_steps == 0 must be a no-op. Without this guard both compositions
+        below still apply their leading half/edge kinetic factor and, at
+        order 4, return psi with an UNPAIRED exp(-i*theta*dt*K^2/4) on it --
+        a silently corrupted state rather than an untouched one.
+        """
+        if n_steps <= 0:
+            if n_steps < 0:
+                raise ValueError(f"run_block: n_steps must be >= 0, got {n_steps}")
+            return
         if self._order == 4:
             self._run_block_4th(n_steps)
         else:
@@ -253,30 +289,101 @@ class GPEPhysics3D:
         self.psi = psi
 
     # -- Diagnostics ---------------------------------------------------------
-    def _kinetic_energy_and_momentum(self, psi, want_momentum: bool):
-        """E_kin, and (jx, jy, jz) if want_momentum else (None, None, None).
+    #
+    # Two paths, because the two callers want different things:
+    #
+    #   _kinetic_energy()  energy only (the imaginary-time convergence check
+    #                      and gates.run_gates' reference). Parseval in k
+    #                      space: ONE forward FFT, no inverse, no derivative
+    #                      array at all.
+    #   _diagnostics_from_currents()  the full report, which needs angular
+    #                      momentum and therefore the current in REAL space.
+    #                      One shared forward FFT + one inverse per axis.
+    #
+    # Both were previously the same routine doing three forward FFTs -- one
+    # per axis, transforming the identical psi three times.
 
-        One axis at a time: an independent FFT pair per axis (3 forward FFTs
-        instead of 1 shared one) so no derivative array outlives its own
-        axis's reduction. Costs a little wall-clock once per block and saves
-        the 24 B/point of holding all three derivatives at once -- this
-        function was the OOM site in this project's history.
+    def _k_marginals(self, dens_k):
+        """|psi_k|^2 collapsed onto each k axis: (Sx, Sy, Sz), each length N
+        (already summed over any leading batch axis).
 
-        Momentum density uses Im(conj(a)*b) = a.real*b.imag - a.imag*b.real,
-        which touches only float32 temporaries; the complex form conjures two
-        extra complex64 (N,N,N) arrays first.
+        Two full reductions per axis and no (N,N,N) temporary at all, which
+        is what makes the Parseval route below cheap in memory as well as in
+        transforms.
         """
+        nd = dens_k.ndim
+        keep = {"x": nd - 1, "y": nd - 2, "z": nd - 3}
+        return tuple(dens_k.sum(axis=tuple(a for a in range(nd) if a != keep[c]))
+                     for c in ("x", "y", "z"))
+
+    def _kinetic_energy(self, psi) -> float:
+        """E_kin = (1/2) integral |grad psi|^2 dV, from ONE forward FFT.
+
+        By Parseval, with the unnormalised (numpy/cupy) forward transform,
+
+            E_kin = (dV / N^3) * sum_k (K^2 / 2) |psi_k|^2
+
+        and K^2 = kx^2 + ky^2 + kz^2 separates, so the k-space density can be
+        reduced straight onto three length-N marginals -- no inverse
+        transform, no complex64 derivative array, nothing of size N^3 alive
+        except |psi_k|^2, which is freed before anything else is allocated.
+
+        Six FFTs and a 24 B/point transient become one FFT and 4 B/point;
+        measured ~4.9x faster than the real-space form it replaces. Agrees
+        with it to 2e-7 relative (float32 round-off), checked against the
+        pre-optimisation reference in tests/test_diagnostics_memory_opt.py.
+
+        The marginals accumulate in float32, exactly as the old full-grid
+        reductions did, and are contracted with the k axes in float64.
+        """
+        dens_k = self._density(fftn(psi, axes=_FFT_AXES))
+        Sx, Sy, Sz = (to_numpy(m).astype(np.float64) for m in self._k_marginals(dens_k))
+        del dens_k
+        kx, ky, kz = (to_numpy(K).astype(np.float64).ravel()
+                      for K in (self.KX, self.KY, self.KZ))
+        return 0.5 * (self.dV / float(self.N ** 3)) * float(
+            np.dot(kx * kx, Sx) + np.dot(ky * ky, Sy) + np.dot(kz * kz, Sz))
+
+    def _diagnostics_from_currents(self, psi):
+        """(E_kin, (Px,Py,Pz), (Lx,Ly,Lz)) from the real-space derivatives.
+
+        Angular momentum weights the current by position, so it cannot be had
+        in k space cheaply -- this path keeps an inverse FFT per axis. What it
+        drops is the forward FFT per axis: psi_k is transformed once and
+        reused, 6 transforms down to 4, at exactly the same peak (psi_k is
+        resident across the loop where the extra forward output used to be).
+
+        Every reduction here is arithmetically identical to the pre-
+        optimisation reference, deliberately. In particular each L component
+        is ONE elementwise difference reduced once, never a difference of two
+        separate reductions: L is strongly cancelling (|Lz| ~ 0.4 against
+        per-term sums of order 1e3 on a generic field), and splitting it
+        costs ~4 significant digits -- measured 9e-5 relative error, against
+        a 1e-5 regression tolerance.
+
+        The current uses Im(conj(a)*b) = a.real*b.imag - a.imag*b.real, which
+        touches only float32 temporaries; the complex form conjures two extra
+        complex64 (N,N,N) arrays first.
+        """
+        psi_k = fftn(psi, axes=_FFT_AXES)
+        dV = self.dV
         E_kin = 0.0
         j = {}
-        for K_axis, letter in ((self.KX, "x"), (self.KY, "y"), (self.KZ, "z")):
-            dpsid = ifftn(1j * K_axis * fftn(psi, axes=_FFT_AXES), axes=_FFT_AXES)
-            E_kin += float(xp.sum(self._density(dpsid))) * self.dV * 0.5
-            if want_momentum:
-                jj = psi.real * dpsid.imag
-                jj -= psi.imag * dpsid.real
-                j[letter] = jj
+        for letter, K_axis in (("x", self.KX), ("y", self.KY), ("z", self.KZ)):
+            dpsid = ifftn(1j * K_axis * psi_k, axes=_FFT_AXES)
+            E_kin += float(xp.sum(self._density(dpsid))) * dV * 0.5
+            jj = psi.real * dpsid.imag
+            jj -= psi.imag * dpsid.real
+            j[letter] = jj
             del dpsid
-        return E_kin, j.get("x"), j.get("y"), j.get("z")
+        del psi_k
+
+        jx, jy, jz = j["x"], j["y"], j["z"]
+        P = (float(xp.sum(jx)) * dV, float(xp.sum(jy)) * dV, float(xp.sum(jz)) * dV)
+        L = (float(xp.sum(self.Y * jz - self.Z * jy)) * dV,
+             float(xp.sum(self.Z * jx - self.X * jz)) * dV,
+             float(xp.sum(self.X * jy - self.Y * jx)) * dV)
+        return E_kin, P, L
 
     def _potential_interaction_energy(self, dens, V) -> tuple[float, float]:
         E_pot = float(xp.sum(V * dens)) * self.dV
@@ -286,9 +393,8 @@ class GPEPhysics3D:
     def _energy_terms(self, psi, V) -> tuple[float, float, float]:
         dens = self._density(psi)
         E_pot, E_int = self._potential_interaction_energy(dens, V)
-        del dens   # freed before the derivative loop, so the two never overlap
-        E_kin, _, _, _ = self._kinetic_energy_and_momentum(psi, want_momentum=False)
-        return E_kin, E_pot, E_int
+        del dens   # freed before the spectral pass, so the two never overlap
+        return self._kinetic_energy(psi), E_pot, E_int
 
     def _energy(self, psi, V) -> float:
         return sum(self._energy_terms(psi, V))
@@ -305,21 +411,28 @@ class GPEPhysics3D:
         E_pot, E_int = self._potential_interaction_energy(dens, V)
         del dens
 
-        E_kin, jx, jy, jz = self._kinetic_energy_and_momentum(psi, want_momentum=True)
+        E_kin, (Px, Py, Pz), (Lx, Ly, Lz) = self._diagnostics_from_currents(psi)
 
         return dict(
             norm=norm, E_total=E_kin + E_pot + E_int,
             E_kin=E_kin, E_pot=E_pot, E_int=E_int,
-            Px=float(xp.sum(jx)) * dV, Py=float(xp.sum(jy)) * dV, Pz=float(xp.sum(jz)) * dV,
-            # <L> = integral of r x j dV (hbar=1)
-            Lx=float(xp.sum(self.Y * jz - self.Z * jy)) * dV,
-            Ly=float(xp.sum(self.Z * jx - self.X * jz)) * dV,
-            Lz=float(xp.sum(self.X * jy - self.Y * jx)) * dV,
+            Px=Px, Py=Py, Pz=Pz,          # <p> = integral of j dV      (hbar=1)
+            Lx=Lx, Ly=Ly, Lz=Lz,          # <L> = integral of r x j dV  (hbar=1)
         )
 
     def get_density_numpy(self):
-        from .backend import to_numpy
         return to_numpy(self._density(self.psi))
+
+    def get_density_slice_numpy(self, index: int, axis: int = -3):
+        """One 2D density plane on the host, WITHOUT materialising the full
+        (N,N,N) density first.
+
+        The obvious `get_density_numpy()[index]` computes an N^3 float32 array
+        and copies all of it across the PCIe bus to throw away all but one
+        plane -- 226 MB per movie frame at N=384. Slicing psi first makes it
+        0.6 MB.
+        """
+        return to_numpy(self._density(xp.take(self.psi, index, axis=axis)))
 
     def free(self) -> None:
         for attr in ('psi', 'V', 'X', 'Y', 'Z', 'KX', 'KY', 'KZ', 'K_sq',

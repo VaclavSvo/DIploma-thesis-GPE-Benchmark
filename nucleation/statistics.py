@@ -74,14 +74,23 @@ def aggregate(rows: list[dict], observables=DEFAULT_OBSERVABLES,
               n_resamples: int = 2000, ci: float = 0.95, seed: int = 0) -> dict:
     """Ensemble summary of one run: mean and bootstrap CI per observable,
     plus onset times and the distribution of the final count."""
+    observables = tuple(observables)
+    if not observables:
+        raise ValueError("aggregate: need at least one observable")
     out = {"n_trajectories": len({r["trajectory"] for r in rows})}
     times = None
     for key in observables:
         times, values = to_matrix(rows, key)
         mean, lo, hi = bootstrap_ci(values, n_resamples, ci, seed)
         out[key] = dict(mean=mean, ci_lo=lo, ci_hi=hi, per_trajectory=values)
-    counts = out["n_lines"]["per_trajectory"]
+    # Onset and final counts come from "n_lines" when it was asked for, and
+    # otherwise from the first observable. Hard-coding "n_lines" here made
+    # aggregate() -- and through it compare_to_control(key=...) -- raise
+    # KeyError for every observable except that one.
+    count_key = "n_lines" if "n_lines" in observables else observables[0]
+    counts = out[count_key]["per_trajectory"]
     out["t"] = times
+    out["count_key"] = count_key
     out["t_nucleation"] = nucleation_onset(times, counts)
     out["final_counts"] = counts[:, -1]
     return out

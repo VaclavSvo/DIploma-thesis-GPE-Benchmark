@@ -77,10 +77,15 @@ def run_tw_ensemble(solver, params: dict, n_blocks: int, steps_per_block: int,
             for k, v in last_phys.items():
                 chunk_history.setdefault(f"phys_{k}", []).append(v)
             if track_density:
+                # Slice psi FIRST, then square: _density(state.psi)[:, n] built
+                # a full (B,N,N,N) float32 (226MB at N=384) to keep one plane,
+                # inside the diagnostics peak this runner exists to avoid.
                 n = z_slice if z_slice is not None else solver.engine.N // 2
-                dens = solver.engine._density(state.psi)
-                mid_slice = (to_numpy(dens[:, n, :, :].mean(axis=0)) if dens.ndim == 4
-                             else to_numpy(dens[n]))
+                psi_b = state.psi
+                plane = psi_b[:, n] if psi_b.ndim == 4 else psi_b[n]
+                dens = solver.engine._density(plane)
+                mid_slice = (to_numpy(dens.mean(axis=0)) if plane.ndim == 3
+                             else to_numpy(dens))
                 chunk_densities.append(mid_slice - offset)
             if observer is not None:
                 observer.on_frame(state, block_idx, traj_offset=n_done)

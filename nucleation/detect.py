@@ -87,7 +87,7 @@ def _axis_origin(engine) -> float:
 
 
 def pierce_points(psi, engine, normal: str, mask, dip_mask=None,
-                  integrality_tol: float = 0.25):
+                  integrality_tol: float = 0.25, diffs=None):
     """Pierce points of one plane family.
 
     Returns (coords (P,3) float32 physical (x, y, z), charges (P,) int8,
@@ -98,18 +98,29 @@ def pierce_points(psi, engine, normal: str, mask, dip_mask=None,
     additionally requires a local density minimum at at least one of the
     plaquette's corners -- winding plus a density dip is a much stronger
     criterion than either alone.
+
+    `diffs` is winding.phase_differences()'s shared cache; pass it when
+    sweeping more than one plane family so the per-axis phase differences
+    (the arctan2 sweeps, the detector's dominant cost) are computed once
+    instead of once per family. None recomputes them for this family alone.
     """
     u, v = W._TRANSVERSE[normal]
-    w = W.winding_volume(psi, normal)
-    err = W.integrality_error(w)
+    w = (W.winding_volume(psi, normal) if diffs is None
+         else W.winding_from_differences(diffs, normal))
+
+    # rint(w) is needed twice -- as the integrality reference and as the
+    # charge -- so it is computed once and handed to both.
+    rounded = xp.rint(w)
+    err = W.integrality_error(w, rounded=rounded)
     if err > integrality_tol:
         raise ResolutionError(
             f"winding on {normal}-planes is not integer to within {integrality_tol} "
             f"(max deviation {err:.3f}) -- dx is too coarse to resolve the vortex cores. "
             f"Raise N or lower L.")
-
-    charge = xp.rint(w).astype(xp.int8)
     del w
+
+    charge = rounded.astype(xp.int8)
+    del rounded
     sel = charge != 0
     sel &= W.plaquette_mask(mask, u, v)
     if dip_mask is not None:
@@ -196,6 +207,23 @@ def _components(n: int, pairs: np.ndarray) -> list[np.ndarray]:
     return np.split(order, splits) if n else []
 
 
+def _pairwise_distances(pts: np.ndarray, row_chunk: int = 256) -> np.ndarray:
+    """Dense (P,P) float32 distance matrix, built `row_chunk` rows at a time.
+
+    `norm(pts[:,None,:] - pts[None,:,:], axis=-1)` materialises a (P,P,3)
+    difference first, three times the matrix it is about to reduce to: at
+    P=4000 that is 192MB of temporary on top of the 64MB result. Chunking the
+    rows caps the temporary at (row_chunk,P,3) and changes nothing about the
+    arithmetic.
+    """
+    n = pts.shape[0]
+    out = np.empty((n, n), dtype=np.float32)
+    for i in range(0, n, row_chunk):
+        blk = pts[i:i + row_chunk, None, :] - pts[None, :, :]
+        out[i:i + row_chunk] = np.sqrt(np.einsum("ijk,ijk->ij", blk, blk))
+    return out
+
+
 def _prim_mst(dist: np.ndarray):
     """Minimum spanning tree of a dense distance matrix -> (parent, weight).
 
@@ -248,7 +276,7 @@ def _tree_diameter(adj: list[list[tuple[int, float]]], start: int = 0):
 
 def trace_lines(points: np.ndarray, charges: np.ndarray, link_cutoff: float,
                 close_cutoff: float | None = None,
-                max_component: int = 20000) -> list[VortexLine]:
+                max_component: int = 4000) -> list[VortexLine]:
     """Group pierce points into vortex lines and measure them.
 
     link_cutoff  -- points closer than this are the same line. A few dx: the
@@ -258,8 +286,15 @@ def trace_lines(points: np.ndarray, charges: np.ndarray, link_cutoff: float,
     close_cutoff -- traced endpoints closer than this mean the line closes on
                     itself (a ring). Defaults to link_cutoff.
     max_component -- components larger than this skip the O(P^2) distance
-                    matrix and report a spanning-tree length only, so one
-                    pathological frame cannot stall a long run.
+                    matrix and are reported with a NaN length, so one
+                    pathological frame cannot stall (or OOM) a long run.
+                    Sized by memory, not by taste: the matrix alone is
+                    4*P^2 bytes, so 4000 caps it at 64MB. The previous 20000
+                    would have asked for 1.6GB -- and, before
+                    _pairwise_distances() chunked it, 4.8GB of (P,P,3)
+                    temporary on top -- i.e. the guard could not fire before
+                    the allocation it was guarding against had already
+                    failed.
     """
     if close_cutoff is None:
         close_cutoff = link_cutoff
@@ -279,7 +314,7 @@ def trace_lines(points: np.ndarray, charges: np.ndarray, link_cutoff: float,
             lines.append(VortexLine(pts, float("nan"), float("nan"), False, float(chg.mean())))
             continue
 
-        d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
+        d = _pairwise_distances(pts)
         parent, weight = _prim_mst(d)
         adj: list[list[tuple[int, float]]] = [[] for _ in range(pts.shape[0])]
         for v in range(1, pts.shape[0]):
@@ -345,15 +380,19 @@ def detect_frame(psi, engine, t: float, trajectory: int, cfg,
     dip = W.local_density_dip(dens, cfg.dip_factor) if cfg.require_density_dip else None
     del dens
 
+    # Every plane family needs the phase differences along the two axes
+    # transverse to its normal, so across all three families each axis is
+    # needed twice -- compute them once here instead of inside each family.
+    diffs = W.phase_differences(psi, cfg.normals)
     coords, charges, normals, err = [], [], [], 0.0
     for normal in cfg.normals:
         c, q, e = pierce_points(psi, engine, normal, mask, dip,
-                                integrality_tol=cfg.integrality_tol)
+                                integrality_tol=cfg.integrality_tol, diffs=diffs)
         coords.append(c)
         charges.append(q)
         normals.append(np.full(q.size, NORMAL_CODE[normal], dtype=np.uint8))
         err = max(err, e)
-    del mask, dip
+    del mask, dip, diffs
 
     points = np.concatenate(coords) if coords else np.empty((0, 3), np.float32)
     charges = np.concatenate(charges) if charges else np.empty(0, np.int8)

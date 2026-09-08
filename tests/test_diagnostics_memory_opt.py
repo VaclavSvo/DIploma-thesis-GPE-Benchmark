@@ -1,9 +1,12 @@
 """Regression test for the GTX 1660 Ti memory optimization pass item 3
 (README.md) -- GPEPhysics3D.compute_diagnostics()
 and ._energy() were rewritten to stream one spectral-derivative axis at a
-time (gpe3d/physics.py's _kinetic_energy_and_momentum), instead of holding
-all 3 derivative arrays simultaneously, to cut the ~40 B/point transient
-peak that caused this project's Phase 2F OOM. The momentum-density formula
+time, instead of holding all 3 derivative arrays simultaneously, to cut the
+~40 B/point transient peak that caused this project's Phase 2F OOM. Those
+routines are now gpe3d/physics.py's _kinetic_energy() (energy only, by
+Parseval in k space -- one forward FFT) and _diagnostics_from_currents()
+(the full report, one shared forward FFT + one inverse per axis); this file
+checks BOTH against the same pre-item-3 reference. The momentum-density formula
 also changed from xp.imag(xp.conj(psi)*dpsid) to the algebraically
 identical real-valued form psi.real*dpsid.imag - psi.imag*dpsid.real (fewer
 complex64 temporaries).
@@ -76,10 +79,38 @@ def _random_psi(shape, seed):
     return (re + 1j * im).astype(xp.complex64)
 
 
+# Momentum and angular momentum are compared against the largest component of
+# their own triple, not against themselves.
+#
+# Why: on the generic random field below, Lz comes out ~0.39 while Lx and Ly
+# are ~600 -- the integrand cancels to 3.2 digits, and float32 carries about
+# 7, so only ~3-4 digits of Lz are real arithmetic and the rest is round-off.
+# A self-relative 1e-5 tolerance on Lz therefore tests the round-off pattern,
+# not the formula: measured against a float64 evaluation of the same integral,
+# BOTH the pre-optimisation reference (8.1e-5 absolute) and the current code
+# (9.9e-5) are equally far from the truth, in the same direction, for the same
+# reason. It passed before only because the two happened to round alike.
+#
+# Comparing against the family's scale is the same rule gates.py already
+# applies to exactly these quantities ("whose reference value is ~0 on a
+# non-rotating ground state, making a relative gate meaningless"). It stays
+# strict where it matters: any real algebraic error -- a swapped sign, a wrong
+# axis pairing, a dropped term -- is O(1) against that scale and still fails
+# by four orders of magnitude.
+_SCALE_FAMILIES = (("Px", "Py", "Pz"), ("Lx", "Ly", "Lz"))
+
+
 def _assert_dicts_close(old: dict, new: dict, rtol: float, label: str):
+    scale = {}
+    for family in _SCALE_FAMILIES:
+        if all(k in old for k in family):
+            s = max(abs(old[k]) for k in family)
+            scale.update({k: s for k in family})
     for k in old:
-        rel = abs(new[k] - old[k]) / max(abs(old[k]), 1e-30)
-        assert rel < rtol, f"{label}: {k} -- old={old[k]!r}, new={new[k]!r} (rel={rel:.2e})"
+        ref = max(abs(old[k]), scale.get(k, 0.0), 1e-30)
+        rel = abs(new[k] - old[k]) / ref
+        assert rel < rtol, (f"{label}: {k} -- old={old[k]!r}, new={new[k]!r} "
+                            f"(|diff|/{ref:.6g} = {rel:.2e})")
 
 
 def test_streamed_diagnostics_matches_old_formula_single_trajectory():

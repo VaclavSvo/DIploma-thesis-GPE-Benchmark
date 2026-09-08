@@ -64,6 +64,37 @@ def _phase_diff(psi, axis):
     return xp.arctan2(im, re)
 
 
+def phase_differences(psi, normals=NORMALS) -> dict:
+    """{axis: arg(psi[..+1] * conj(psi))} for every axis the requested plane
+    families need -- computed ONCE and shared between them.
+
+    Each plane family uses the two axes transverse to its normal, so across
+    all three families every axis is needed exactly twice. Computing them per
+    family runs six arctan2 sweeps of the full grid per trajectory per frame
+    where three will do; arctan2 is the single most expensive operation in
+    the detector.
+
+    Costs one extra resident float32 (N,N,N) (three cached differences rather
+    than the two a single family holds) and saves half the phase work.
+    """
+    axes = {a for n in normals for a in _TRANSVERSE[n]}
+    return {a: _phase_diff(psi, a) for a in axes}
+
+
+def winding_from_differences(diffs: dict, normal: str):
+    """Plaquette winding for one plane family from phase_differences()'s
+    cache. Same result as winding_volume(psi, normal), one array allocated.
+    """
+    u, v = _TRANSVERSE[normal]
+    du, dv = diffs[u], diffs[v]
+    w = xp.roll(dv, -1, axis=u)
+    w += du
+    w -= xp.roll(du, -1, axis=v)
+    w -= dv
+    w *= 1.0 / _TWO_PI      # in place: `w / _TWO_PI` is another full grid
+    return w
+
+
 def plaquette_winding(psi, axis_u, axis_v):
     """Winding number per plaquette spanned by (axis_u, axis_v).
 
@@ -76,10 +107,12 @@ def plaquette_winding(psi, axis_u, axis_v):
     """
     du = _phase_diff(psi, axis_u)
     dv = _phase_diff(psi, axis_v)
-    w = du + xp.roll(dv, -1, axis=axis_u)
+    w = xp.roll(dv, -1, axis=axis_u)
+    w += du
     w -= xp.roll(du, -1, axis=axis_v)
     w -= dv
-    return w / _TWO_PI
+    w *= 1.0 / _TWO_PI
+    return w
 
 
 def winding_volume(psi, normal: str):
@@ -90,6 +123,9 @@ def winding_volume(psi, normal: str):
     finds lines along z and misses a ring lying in the y-z plane entirely.
     Compute all three families (or at least the ones you can afford) so lines
     of any orientation are caught.
+
+    Sweeping more than one family: use phase_differences() +
+    winding_from_differences() instead, which shares the phase work.
     """
     u, v = _TRANSVERSE[normal]
     return plaquette_winding(psi, u, v)
@@ -126,33 +162,51 @@ def slice_plane(field, normal: str, index: int):
     return xp.take(field, index, axis=axis)
 
 
-def integrality_error(w) -> float:
+def integrality_error(w, rounded=None) -> float:
     """max |w - round(w)| -- 0 for perfectly resolved cores. A large value
     means dx is too coarse for the healing length and the "charges" being
-    counted are not integers at all. One pass over an array already in memory,
-    so it is worth asserting every frame."""
-    return float(xp.max(xp.abs(w - xp.rint(w))))
+    counted are not integers at all. Worth asserting every frame.
+
+    `rounded` lets a caller that already needs rint(w) (the pierce finder
+    needs it as the charge) hand it in, so the rounding is done once.
+
+    max|d| is taken as max(max(d), -min(d)) rather than max(abs(d)): two
+    reductions over an array already in memory instead of one more full
+    (N,N,N) temporary.
+    """
+    d = xp.rint(w) if rounded is None else rounded
+    d = d - w
+    return float(max(float(xp.max(d)), -float(xp.min(d))))
 
 
 _SPATIAL_AXES = (AX_Z, AX_Y, AX_X)
 
 
 def dilate(mask, passes: int = 1, axes=_SPATIAL_AXES):
-    """Grow a boolean mask by `passes` cells along each of `axes`."""
+    """Grow a boolean mask by `passes` cells along each of `axes`.
+
+    One pass is a single 6-neighbour (von Neumann) dilation: every roll is of
+    the pass's INPUT mask, never of the partly-grown result, so `passes` cells
+    means exactly `passes` cells. Accumulated in place -- with close_passes=4
+    the out-of-place form allocated 24 full boolean grids per call.
+    """
     for _ in range(passes):
-        grown = mask
+        grown = mask.copy()
         for axis in axes:
-            grown = grown | xp.roll(mask, 1, axis=axis) | xp.roll(mask, -1, axis=axis)
+            grown |= xp.roll(mask, 1, axis=axis)
+            grown |= xp.roll(mask, -1, axis=axis)
         mask = grown
     return mask
 
 
 def erode(mask, passes: int = 1, axes=_SPATIAL_AXES):
-    """Shrink a boolean mask by `passes` cells along each of `axes`."""
+    """Shrink a boolean mask by `passes` cells along each of `axes` -- the
+    exact dual of dilate(), same in-place accumulation."""
     for _ in range(passes):
-        shrunk = mask
+        shrunk = mask.copy()
         for axis in axes:
-            shrunk = shrunk & xp.roll(mask, 1, axis=axis) & xp.roll(mask, -1, axis=axis)
+            shrunk &= xp.roll(mask, 1, axis=axis)
+            shrunk &= xp.roll(mask, -1, axis=axis)
         mask = shrunk
     return mask
 
@@ -218,5 +272,12 @@ def local_density_dip(dens, factor: float = 0.6, axes=_SPATIAL_AXES):
     """
     smooth = dens
     for axis in axes:
-        smooth = (xp.roll(smooth, 1, axis=axis) + smooth + xp.roll(smooth, -1, axis=axis)) / 3.0
-    return dens < (factor * smooth)
+        nxt = xp.roll(smooth, 1, axis=axis)
+        nxt += smooth
+        nxt += xp.roll(smooth, -1, axis=axis)
+        nxt *= 1.0 / 3.0
+        smooth = nxt
+    if smooth is dens:      # axes=() -- never mutate the caller's array
+        return dens < (factor * dens)
+    smooth *= factor        # `factor * smooth` was one more full grid
+    return dens < smooth

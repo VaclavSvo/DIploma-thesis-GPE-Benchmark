@@ -28,8 +28,11 @@ def run_and_record(solver, state, n_blocks: int, steps_per_block: int,
         for k, v in solver.get_derived_quantities(state).items():
             history.setdefault(k, []).append(v)
         if track_density:
+            # get_density_slice_numpy, not get_density_numpy()[n]: the latter
+            # builds the whole (N,N,N) density and copies all of it to the
+            # host to keep one plane -- 226MB per frame at N=384.
             n = z_slice if z_slice is not None else solver.engine.N // 2
-            densities.append(solver.engine.get_density_numpy()[n])
+            densities.append(solver.engine.get_density_slice_numpy(n))
         if observer is not None:
             observer.on_frame(state, block_idx)
 

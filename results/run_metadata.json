@@ -1,0 +1,42 @@
+{
+  "L": 24.0,
+  "N": 248,
+  "T_TOTAL": 2.5,
+  "depletion_fraction": 0.05945,
+  "detector": {
+    "close_cutoff_dx": 2.5,
+    "detect_stride": 1,
+    "dip_factor": 0.75,
+    "integrality_tol": 0.25,
+    "link_cutoff_dx": 1.8,
+    "mask_close_passes": 4,
+    "mask_threshold": 0.08,
+    "normals": [
+      "x",
+      "y",
+      "z"
+    ],
+    "require_density_dip": true,
+    "slice_planes": [
+      "x",
+      "y",
+      "z"
+    ],
+    "slice_stride": 1,
+    "slice_trajectory": 0
+  },
+  "dt": 0.025252525252525252,
+  "dx": 0.09716606140136719,
+  "effective_cutoff_multiplier": 7.048288263891048,
+  "g": 0.003523257353164062,
+  "n_blocks": 99,
+  "n_trajectories": 1,
+  "omega": [
+    1.0,
+    0.35355339059327373,
+    0.35355339059327373
+  ],
+  "scenario": "nucleation_collision",
+  "splitstep_order": 4,
+  "steps_per_block": 1
+}

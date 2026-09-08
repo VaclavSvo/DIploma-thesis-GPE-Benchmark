@@ -18,10 +18,21 @@ from .vortex_map import save_vortex_map
 
 
 def healing_length(g: float, n_peak: float) -> float:
-    """xi = 1/sqrt(g*n) in these natural units (hbar=m=1). The core is ~xi
-    across, so dx must be a fraction of it or the windings stop being
-    integers."""
-    return float("inf") if g * n_peak <= 0 else 1.0 / math.sqrt(g * n_peak)
+    """xi = 1/sqrt(2*g*n) in these natural units (hbar=m=1).
+
+    From balancing the quantum pressure against the interaction energy,
+    hbar^2/(2*m*xi^2) = g*n (Pitaevskii & Stringari, "Bose-Einstein
+    Condensation", Sec. 5.2; Pethick & Smith, Sec. 6.2). The core is a couple
+    of xi across, so dx must be a fraction of it or the windings stop being
+    integers.
+
+    This used to return 1/sqrt(g*n) -- the OTHER convention, larger by
+    sqrt(2) -- while gpe3d/noise.py's cutoff is built on 1/sqrt(2*g*n). Two
+    conventions in one project made run.py's printed dx/xi optimistic by
+    sqrt(2), so a grid at dx = 0.4*xi_true reported 0.28 and passed the
+    "cores resolved" line. Both now mean the same thing.
+    """
+    return float("inf") if g * n_peak <= 0 else 1.0 / math.sqrt(2.0 * g * n_peak)
 
 
 def resolution_note(engine, g: float, n_peak: float) -> dict:
@@ -74,9 +85,13 @@ def write_outputs(observer: NucleationObserver, out_dir: str, meta: dict,
             os.path.join(out_dir, "density_winding.gif"),
             fps=gif_fps, extent=box_extent, duration=duration)
     if vortex_map and observer.frames:
+        # One trajectory, like density_winding.gif and for the same reason:
+        # the stored frames interleave every trajectory on the same time grid,
+        # so animating them all would cut between realisations frame by frame.
         paths["vortex_map"] = save_vortex_map(
             npz_path, os.path.join(out_dir, "vortex_map.gif"),
-            extent=box_extent or (-1.0, 1.0), fps=gif_fps, duration=duration)
+            extent=box_extent or (-1.0, 1.0), fps=gif_fps, duration=duration,
+            trajectory=observer.cfg.slice_trajectory)
     return paths
 
 

@@ -30,12 +30,39 @@ _VIEWS = {
 }
 
 
-def load_run(npz_path: str):
-    """(times, [points per frame]) from a saved pierce_points.npz."""
+def load_run(npz_path: str, trajectory: int | None = 0):
+    """(times, [points per frame]) from a saved pierce_points.npz.
+
+    `trajectory` selects ONE realisation; None keeps every stored frame.
+
+    Selecting matters: the observer stores one frame per (trajectory, time),
+    so an 8-trajectory run's arrays hold each time eight times over, in
+    block-major order. Animating them unfiltered plays t0(traj0), t0(traj1),
+    ... -- eight different realisations cutting between each other at every
+    time step, with each time repeated eight times on the count-vs-time
+    strip's x axis. Vortices nucleate in different places in every
+    trajectory, so that is not a noisier version of the right picture; it is
+    a different picture at every frame.
+
+    An unknown `trajectory` falls back to the lowest one present rather than
+    raising, so an old npz written before trajectories were stored still
+    renders.
+    """
     data = np.load(npz_path)
     off = data["frame_offset"]
-    pts = [data["points"][off[i]:off[i + 1]] for i in range(len(off) - 1)]
-    return np.asarray(data["frame_t"], dtype=float), pts
+    t_all = np.asarray(data["frame_t"], dtype=float)
+    traj = (np.asarray(data["frame_trajectory"]) if "frame_trajectory" in data
+            else np.zeros(t_all.size, dtype=int))
+
+    keep = np.arange(t_all.size)
+    if trajectory is not None and traj.size:
+        sel = np.flatnonzero(traj == trajectory)
+        if sel.size == 0:
+            sel = np.flatnonzero(traj == traj.min())
+        keep = sel
+    keep = keep[np.argsort(t_all[keep], kind="stable")]
+    pts = [data["points"][off[i]:off[i + 1]] for i in keep]
+    return t_all[keep], pts
 
 
 def frame_histograms(points_per_frame, extent, bins: int, views=("x", "y", "z")):
@@ -60,7 +87,7 @@ def save_vortex_map(npz_path: str, out_path: str, extent=(-8.0, 8.0), bins: int 
                      fps: int = 60, duration: float | None = None,
                      views=("x", "y", "z"), gamma: float = 0.5,
                      clip_percentile: float = 99.5, dpi: int = 90,
-                     counts_panel: bool = True) -> str:
+                     counts_panel: bool = True, trajectory: int | None = 0) -> str:
     """Render the animation.
 
     duration -- playback seconds. Default: the run's own simulated time, so
@@ -69,6 +96,9 @@ def save_vortex_map(npz_path: str, out_path: str, extent=(-8.0, 8.0), bins: int 
     gamma    -- power-law colour scale. 0.5 keeps three vortices at t=0
                 visible on the same fixed scale as thirteen hundred at t=8;
                 a linear scale renders the whole first half black.
+    trajectory -- which realisation to animate (see load_run); None means
+                all stored frames, which only makes sense for a single-
+                trajectory run.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -76,10 +106,12 @@ def save_vortex_map(npz_path: str, out_path: str, extent=(-8.0, 8.0), bins: int 
     import matplotlib.animation as animation
     from matplotlib.colors import PowerNorm
 
-    times, pts = load_run(npz_path)
+    times, pts = load_run(npz_path, trajectory)
     counts = np.array([p.shape[0] for p in pts], dtype=float)
     hists = frame_histograms(pts, extent, bins, views)
 
+    if times.size < 1:
+        raise ValueError(f"{npz_path} holds no frames for trajectory {trajectory}")
     span = float(times[-1] - times[0]) or 1.0
     sub = sub_frames_for(len(times), fps, duration if duration else span)
     frames = {v: interpolate_frames(hists[v], sub) for v in views}
@@ -165,10 +197,13 @@ def _cli(argv=None) -> int:
     ap.add_argument("--dpi", type=int, default=90)
     ap.add_argument("--views", default="xyz", help="which projections, e.g. 'xz'")
     ap.add_argument("--no-counts", action="store_true", help="drop the count-vs-time strip")
+    ap.add_argument("--trajectory", type=int, default=0,
+                    help="which trajectory to animate (-1 = all stored frames)")
     a = ap.parse_args(argv)
     path = save_vortex_map(a.npz, a.out, extent=(-a.half_box, a.half_box), bins=a.bins,
                             fps=a.fps, duration=a.duration, views=tuple(a.views),
-                            dpi=a.dpi, counts_panel=not a.no_counts)
+                            dpi=a.dpi, counts_panel=not a.no_counts,
+                            trajectory=None if a.trajectory < 0 else a.trajectory)
     print(f"wrote {path}")
     return 0
 

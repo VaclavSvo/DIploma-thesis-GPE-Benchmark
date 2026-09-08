@@ -44,11 +44,13 @@ SCENARIO = "nucleation_collision"
 # solver     "trapped" | "collision"      -- which geometry
 # tw         True adds Truncated-Wigner noise (a TW* solver class in run.py)
 # physical   True derives g from Na-23 + OMEGA_REF_HZ; False uses a bare G
-# v_split    each cloud's COM-frame speed is v_rel / v_split. The collision
-#            scenarios use /4, the nucleation ones /2; /2 is the correct
-#            "each cloud carries half the relative velocity" convention, and
-#            the /4 rows are kept as-is because their grid/velocity gate was
-#            tuned against them.
+# v_rel_real  the clouds' RELATIVE closing speed in m/s. Each cloud is given
+#            half of it in the COM frame, always -- there is no second knob.
+#            (There used to be a `v_split` divisor, 4 on the collision rows
+#            and 2 on the nucleation ones, so "v_rel_real" on the /4 rows was
+#            twice the relative velocity those rows actually simulated. The
+#            numbers below were halved to match, so every row's dynamics are
+#            byte-for-byte what they were -- only the label is now true.)
 # separation      (x,y,z) between the cloud centres. Half of it displaces each
 #            cloud, in opposite directions.
 # impact_offset   (x,y,z) impact parameter, split between the clouds the same
@@ -74,15 +76,22 @@ _WIDE = (1.0, 1.0 / ANISOTROPY, 1.0 / ANISOTROPY)
 _NUCLEATION = dict(
     solver="collision", physical=True, omega=_WIDE,
     n_per_cloud=5.0e3, n_clouds=2.0,
-    v_rel_real=2.0e-3, v_split=2.0,
+    v_rel_real=4.0e-3,
     separation=(8.0, 0.0, 0.0), impact_offset=(0.0, 3.0, 0.0),
     cutoff=3.0, cutoff_n_ref=96, cutoff_exponent=0.9, cutoff_nyquist_safety=3.0,
     seed=int(time()), order4_dt_multiplier=200.0,
     batch_size=2,          # detection needs each trajectory's own field anyway
-    N=320, L=24.0,         # N=384 (dx=0.042) resolves cores better; 256 is the
-                            # quick look. run.py prints dx/xi, and the detector
-                            # raises if the windings stop being integers.
-    t_total=2.5,           # the snake instability needs several xi/c_s AFTER
+    N=250, L=24.0,         # 250 = 2*5^3, all small prime factors. Was 248 =
+                            # 2^3*31: FFT cost is set by N's LARGEST prime
+                            # factor, and a factor of 31 pushes cuFFT onto its
+                            # Bluestein path (~25% slower per point measured on
+                            # CPU, worse on GPU) for a 0.8% change in dx.
+                            # backend.check_fft_grid_size() warns about this and
+                            # suggests exactly 250. N=384 (dx=0.063) resolves
+                            # cores better; 250 is the quick look. run.py prints
+                            # dx/xi, and the detector raises if the windings
+                            # stop being integers.
+    t_total=2.0,           # the snake instability needs several xi/c_s AFTER
                             # the clouds overlap; stopping at overlap shows
                             # fringes and no vortices, which reads as a null
                             # result but is just an early stop.
@@ -99,7 +108,8 @@ SCENARIOS = {
     "collision": dict(
         solver="collision", tw=False, physical=True, omega=_WIDE,
         n_per_cloud=1.0e4,     # scaled down from the paper's ~1e6/cloud
-        n_clouds=2.0, v_rel_real=4.0e-3, v_split=4.0,
+        n_clouds=2.0, v_rel_real=2.0e-3,   # was v_rel_real=4e-3 with v_split=4,
+                                            # i.e. the same 2e-3 relative speed
         separation=(6.0, 0.0, 0.0),   # not from the paper: just large enough
                                        # that the clouds don't overlap at t=0
         impact_offset=(0.0, 0.0, 0.0),   # head-on
@@ -120,10 +130,13 @@ SCENARIOS = {
     "tw_collision": dict(
         solver="collision", tw=True, physical=True, omega=_WIDE,
         n_per_cloud=5.0e3,
-        n_clouds=4.0,          # FLAGGED: inconsistent with n_per_cloud (two
-                                # clouds), and depletion_fraction is measured
-                                # against it. The nucleation rows use 2.0.
-        v_rel_real=2.0e-3, v_split=4.0,
+        n_clouds=2.0,          # FIXED (was 4.0): there are two clouds, and
+                                # N_PARTICLES = n_clouds*n_per_cloud is what
+                                # two_cloud_collision_psi() renormalises the
+                                # pair to, so 4.0 put 1e4 atoms in each 5e3
+                                # cloud AND measured depletion_fraction
+                                # against a target twice the real one.
+        v_rel_real=1.0e-3,     # was v_rel_real=2e-3 with v_split=4: same speed
         separation=(6.0, 0.0, 0.0), impact_offset=(0.0, 0.0, 0.0),
         n_traj=4, batch_size=1,
         cutoff=3.0, cutoff_n_ref=128, cutoff_exponent=0.85, cutoff_nyquist_safety=3.0,
@@ -150,9 +163,14 @@ SCENARIOS = {
                                       # T_TOTAL run -- see README
         N=256, L=10.0, t_total=3.0),
 
-    "nucleation_collision": dict(_NUCLEATION, tw=True, n_traj=8, batch_size=4),
-    # 4 trajectories is fine for the conservation gates and useless for
-    # nucleation statistics; 20-50 independent seeds for a real number.
+    "nucleation_collision": dict(_NUCLEATION, tw=True, n_traj=50, batch_size=10),
+    # n_traj was 1, which is why the run report said "trajectories: 1" and its
+    # CIs collapsed onto the point estimate -- a single realisation has no
+    # spread to measure. 8 is the smallest ensemble that gives a non-degenerate
+    # bootstrap interval; 20-50 independent seeds for a number worth quoting.
+    # batch_size: psi is (batch, 250^3) complex64, ~125 MB per trajectory, so a
+    # chunk of 2 is ~0.25 GB before FFT workspace. 2 is
+    # _NUCLEATION's own default; raise it only with GPU headroom to spare.
 
     "nucleation_control": dict(_NUCLEATION, tw=False, n_traj=1),
 }
@@ -212,8 +230,10 @@ if _S["solver"] == "collision":
     N_PARTICLES = _S["n_clouds"] * N_PER_CONDENSATE
     COLLISION_SEPARATION = _S["separation"]
     COLLISION_IMPACT_OFFSET = _S.get("impact_offset", (0.0, 0.0, 0.0))
+    # Each cloud carries half the relative velocity, by definition of the COM
+    # frame -- see the v_rel_real note in the table header.
     COLLISION_HALF_VELOCITY = (
-        velocity_to_natural(_S["v_rel_real"], units) / _S["v_split"], 0.0, 0.0)
+        0.5 * velocity_to_natural(_S["v_rel_real"], units), 0.0, 0.0)
     SOLVER_PARAMS.update(n_particles_per_cloud=N_PER_CONDENSATE,
                           separation=COLLISION_SEPARATION,
                           impact_offset=COLLISION_IMPACT_OFFSET,
