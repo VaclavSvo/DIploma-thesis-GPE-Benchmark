@@ -11,13 +11,26 @@ per-trajectory mean within its chunk, and the overall mean is the chunk-size-
 weighted average of those (a sum over a partition equals the sum of partial
 sums). Constants like depletion_fraction trivially survive the same average.
 """
+import time
+
 from .backend import xp, to_numpy
+
+
+def format_duration(seconds: float) -> str:
+    """Compact h/m/s, for progress lines."""
+    seconds = max(0.0, float(seconds))
+    if seconds < 90.0:
+        return f"{seconds:.0f}s"
+    if seconds < 5400.0:
+        return f"{seconds / 60.0:.1f}m"
+    return f"{seconds / 3600.0:.1f}h"
 
 
 def run_tw_ensemble(solver, params: dict, n_blocks: int, steps_per_block: int,
                      n_trajectories: int, batch_size: int,
                      track_density: bool = False, z_slice: int | None = None,
-                     diagnostics_every: int = 1, observer=None):
+                     diagnostics_every: int = 1, observer=None,
+                     progress: bool = False):
     """Evolve ceil(n_trajectories/batch_size) chunks through the same
     n_blocks x steps_per_block schedule, returning (history, densities) as
     ensemble means. Chunk seeds are offset off params["seed"] so the whole
@@ -37,6 +50,15 @@ def run_tw_ensemble(solver, params: dict, n_blocks: int, steps_per_block: int,
         nucleate in different places in every trajectory, so the ensemble-mean
         density is a smooth blob with no cores in it. traj_offset is the
         global index of the chunk's first trajectory.
+
+    progress -- print a one-line, self-overwriting block counter with a rate
+        and an ETA. Without it this function is SILENT from the first block
+        until a whole chunk has finished -- and with an observer attached a
+        chunk is n_blocks x batch_size full-grid detections, which at
+        production N is easily an hour. A long run and a hung one then look
+        exactly alike from the terminal, which is not a state to leave a user
+        in. The line is one print per block against a block that is at minimum
+        several FFTs of the whole batch, so it costs nothing measurable.
     """
     if batch_size < 1:
         raise ValueError(f"run_tw_ensemble: batch_size must be >= 1, got {batch_size}")
@@ -91,9 +113,21 @@ def run_tw_ensemble(solver, params: dict, n_blocks: int, steps_per_block: int,
                 observer.on_frame(state, block_idx, traj_offset=n_done)
 
         record(0, force=True)
+        t_chunk0 = time.time()
         for i in range(n_blocks):
             solver.call(state, steps_per_block)
             record(i + 1, force=(i == n_blocks - 1))
+            if progress:
+                done = i + 1
+                elapsed = time.time() - t_chunk0
+                per_block = elapsed / done
+                remaining = per_block * ((n_blocks - done)
+                                         + n_blocks * (n_chunks - chunk_idx - 1))
+                print(f"\r  chunk {chunk_idx + 1}/{n_chunks}  block {done}/{n_blocks}"
+                      f"  t={state.t:.3f}  {per_block:.2f}s/block"
+                      f"  ETA {format_duration(remaining)}      ", end="", flush=True)
+        if progress:
+            print()
 
         if history_sum is None:
             t_values = chunk_history["t"]

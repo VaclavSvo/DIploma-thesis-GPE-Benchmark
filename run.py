@@ -28,7 +28,10 @@ SOLVERS = {
     ("collision", False): CollidingCondensatesSolver,
     ("collision", True): TWCollidingCondensatesSolver,
 }
-NUCLEATION_SCENARIOS = ("nucleation_collision", "nucleation_control")
+# Scenarios that run through the vortex detector + density/winding movie
+# instead of run.py's own plain density gif.
+NUCLEATION_SCENARIOS = ("nucleation_collision", "nucleation_control",
+                        "halo_collision", "halo_control")
 
 
 def _spec() -> dict:
@@ -78,6 +81,23 @@ def build_solver_and_state():
         solver.prepare_mean_field(config.SOLVER_PARAMS)
         return solver, None
     return solver, solver.init_state(config.SOLVER_PARAMS)
+
+
+def _batch_memory_note(N: int, batch_size: int) -> str:
+    """Rough resident-memory estimate for a TW chunk, and a warning if it is
+    large. Coefficients are performance.md's measured breakdown: ~17 B/point
+    persistent (K_sq, V, mask, psi_mean), 8 B/point per resident trajectory
+    (psi), and a ~24 B/point-per-trajectory transient inside
+    compute_diagnostics(). batch_size multiplies the last two, which is the
+    part that is easy to miss -- it is the difference between a run that fits
+    and one that spends its life in the allocator.
+    """
+    gib = N ** 3 * (17 + 32 * batch_size) / 2 ** 30
+    note = f"~{gib:.2f} GiB resident"
+    if gib > 4.0:
+        note += ("  <-- WARNING: near a 6 GB card's limit; lower batch_size "
+                 "(it only trades memory for wall-clock, the chunking is exact)")
+    return note
 
 
 def _section(title: str) -> None:
@@ -173,7 +193,8 @@ def main():
         temp_note = (f"temperature_natural={solver.temperature_natural:.4g} (finite-T)"
                      if solver.temperature_natural > 0.0 else "temperature_natural=0.0 (vacuum-only)")
         print(f"noise cutoff: {solver.n_cutoff_modes}/{config.N ** 3} modes included   {temp_note}")
-        print(f"n_traj={config.N_TRAJECTORIES}   batch_size={config.BATCH_SIZE}")
+        print(f"n_traj={config.N_TRAJECTORIES}   batch_size={config.BATCH_SIZE}   "
+              f"{_batch_memory_note(config.N, config.BATCH_SIZE)}")
     else:
         _section("Evolution setup")
     print(f"dt={dt:.4e} (accuracy limit {dt_accuracy:.4e}, shrunk onto {total_steps} whole "
@@ -210,9 +231,20 @@ def main():
               f"movie planes: {','.join(detector_cfg.slice_planes)} "
               f"(trajectory {detector_cfg.slice_trajectory})")
         n_detect = len({*range(0, n_blocks + 1, detector_cfg.detect_stride), n_blocks})
+        n_detections = n_detect * config.N_TRAJECTORIES
         print(f"detecting on {n_detect}/{n_blocks + 1} recorded frames "
               f"(stride {detector_cfg.detect_stride}) x {config.N_TRAJECTORIES} trajectories "
-              f"= {n_detect * config.N_TRAJECTORIES} detections")
+              f"= {n_detections} detections")
+        if n_detections > 200:
+            # One detection is three full-grid phase sweeps plus a
+            # morphological closing, so this number -- not n_blocks, and not
+            # the movie's frame count -- is what a nucleation run's wall-clock
+            # is made of. It scales with n_traj, which is easy to raise without
+            # noticing that it multiplies the detector too.
+            print(f"NOTE: {n_detections} detections is a lot -- this, not the "
+                  f"evolution, will dominate the run. Raise "
+                  f"NUCLEATION_DETECT_STRIDE (the movie's slice cadence is "
+                  f"separate and stays cheap) or lower n_traj.")
         psi_ref = solver.psi_mean if _spec()['tw'] else state.psi
         res = nucleation_runner.resolution_note(   # reused by the metadata below
             solver.engine, config.G, float(solver.engine._density(psi_ref).max()))
@@ -228,11 +260,13 @@ def main():
         history, densities = ensemble.run_tw_ensemble(
             solver, config.SOLVER_PARAMS, n_blocks, steps_per_block,
             n_trajectories=config.N_TRAJECTORIES, batch_size=config.BATCH_SIZE,
-            track_density=track_density, observer=observer)
+            track_density=track_density, observer=observer,
+            progress=config.VERBOSE)
     else:
         history, densities = evolve.run_and_record(solver, state, n_blocks, steps_per_block,
                                                      track_density=track_density,
-                                                     observer=observer)
+                                                     observer=observer,
+                                                     progress=config.VERBOSE)
     wall = time.time() - t_run0
 
     _section("Evolution")

@@ -13,7 +13,7 @@ import numpy as np
 from . import io, statistics as st
 from .observer import NucleationObserver
 from .settings import DetectorConfig
-from .visualise import save_density_winding_gif
+from .visualise import save_density_winding_gif, save_momentum_gif
 from .vortex_map import save_vortex_map
 
 
@@ -83,7 +83,20 @@ def write_outputs(observer: NucleationObserver, out_dir: str, meta: dict,
         paths["gif"] = save_density_winding_gif(
             observer.slices, observer.times, observer.cfg.slice_planes,
             os.path.join(out_dir, "density_winding.gif"),
-            fps=gif_fps, extent=box_extent, duration=duration)
+            fps=gif_fps, extent=box_extent, duration=duration,
+            log_density=observer.cfg.density_log,
+            log_floor_frac=observer.cfg.density_log_floor)
+    if observer.times and observer.cfg.momentum_planes:
+        # The halo's own view: a shell in k-space, cut as a ring by the plane
+        # holding the collision axis. Rendered from stored (N,N) frames, so
+        # like the other two movies it costs no GPU time to redo.
+        paths["momentum"] = save_momentum_gif(
+            observer.slices, observer.times, observer.cfg.momentum_planes,
+            os.path.join(out_dir, "momentum.gif"),
+            fps=gif_fps, k_extent=observer.momentum_extent, duration=duration,
+            floor=observer.cfg.momentum_floor,
+            vmax=observer.cfg.momentum_vmax,
+            ring=observer.cfg.momentum_ring)
     if vortex_map and observer.frames:
         # One trajectory, like density_winding.gif and for the same reason:
         # the stored frames interleave every trajectory on the same time grid,

@@ -26,11 +26,21 @@ def to_matrix(rows: list[dict], key: str):
     trajectories = sorted({r["trajectory"] for r in rows})
     times = sorted({round(float(r["t"]), 9) for r in rows})
     values = np.full((len(trajectories), len(times)), np.nan)
+    # Filled separately from `values`: a cell can legitimately CONTAIN NaN.
+    # trace_lines() returns a NaN length for any component above max_component
+    # (its documented memory guard), which a dense tangle -- the halo_collision
+    # row's normal state -- hits routinely. Testing np.isnan(values) for the
+    # grid check therefore killed a finished run at the reporting step, hours
+    # after the physics was done and before write_outputs() had saved anything,
+    # with a message about a time grid that was in fact perfectly aligned.
+    filled = np.zeros(values.shape, dtype=bool)
     t_index = {t: i for i, t in enumerate(times)}
     traj_index = {tr: i for i, tr in enumerate(trajectories)}
     for r in rows:
-        values[traj_index[r["trajectory"]], t_index[round(float(r["t"]), 9)]] = r[key]
-    if np.isnan(values).any():
+        i, j = traj_index[r["trajectory"]], t_index[round(float(r["t"]), 9)]
+        values[i, j] = r[key]
+        filled[i, j] = True
+    if not filled.all():
         raise ValueError(f"'{key}' is missing for some (trajectory, time) pairs -- "
                          "the trajectories were not recorded on a common time grid")
     return np.asarray(times), values

@@ -55,6 +55,7 @@ class VortexFrame:
     n_peak: float
     integrality_error: float
     lines: list[VortexLine] = field(default_factory=list)
+    linking_skipped: bool = False
 
     # -- scalar observables, the columns that end up in the CSV ------------
     def summary(self) -> dict:
@@ -68,9 +69,14 @@ class VortexFrame:
             n_lines=len(self.lines),
             n_lines_closed=len(closed),
             n_lines_open=len(self.lines) - len(closed),
-            L_total=float(sum(lengths)),
-            L_closed=float(sum(ln.length for ln in closed)),
-            L_max=float(max(lengths)) if lengths else 0.0,
+            # NaN, not 0, when linking was skipped: zero length is a claim, and
+            # the flag beside it says the claim was never made. n_lines stays an
+            # int so the CSV round-trip keeps working; read it with the flag.
+            linking_skipped=int(self.linking_skipped),
+            L_total=float("nan") if self.linking_skipped else float(sum(lengths)),
+            L_closed=float("nan") if self.linking_skipped else float(sum(ln.length for ln in closed)),
+            L_max=float("nan") if self.linking_skipped
+                  else (float(max(lengths)) if lengths else 0.0),
             n_peak=self.n_peak,
             integrality_error=self.integrality_error,
         )
@@ -149,16 +155,45 @@ class ResolutionError(RuntimeError):
 # ---------------------------------------------------------------------------
 # Stage 2 -- linking pierce points into lines
 # ---------------------------------------------------------------------------
+#
+# Both stages here are HOST-side Python over the pierce points, and the pierce
+# count is not bounded by anything the rest of the run knows about: a
+# Truncated-Wigner field carries a phase singularity wherever the vacuum's own
+# speckle dips through the density mask, so a run whose mask threshold sits in
+# the vacuum's exponential tail hands this code a million points instead of a
+# few thousand. Measured on a real halo frame with P = 1,271,639:
+#
+#     spatial hash + union-find (below)   36.6s + 20.7s = 57.3s   per frame
+#     cKDTree + scipy connected_components 3.6s +  1.2s =  4.8s   per frame
+#
+# -- identical pair sets and identical components, 12x faster. That difference
+# is a run that finishes and one that looks hung with the GPU at 30%, so scipy
+# is used when it is importable and the originals stay as the fallback.
+try:
+    from scipy.spatial import cKDTree as _cKDTree
+except ImportError:                                    # pragma: no cover
+    _cKDTree = None
+try:
+    from scipy.sparse import coo_matrix as _coo_matrix
+    from scipy.sparse.csgraph import connected_components as _connected_components
+except ImportError:                                    # pragma: no cover
+    _coo_matrix = _connected_components = None
+
+_LINKING_WARNED = False
+
 
 def _neighbour_pairs(points: np.ndarray, cutoff: float):
-    """All index pairs closer than `cutoff`, via a uniform spatial hash.
+    """All index pairs closer than `cutoff`.
 
-    O(P * occupancy) instead of O(P^2): at N=384 a busy frame carries a few
-    thousand pierce points and the pairwise matrix would be the dominant
-    cost of the whole diagnostic.
+    scipy's cKDTree when available (same "distance <= r", same i<j ordering),
+    otherwise the uniform spatial hash below -- O(P * occupancy) instead of
+    O(P^2), which is still far better than a dense pairwise matrix.
     """
     if points.shape[0] < 2:
         return np.empty((0, 2), dtype=np.int64)
+    if _cKDTree is not None:
+        pairs = _cKDTree(points).query_pairs(cutoff, output_type="ndarray")
+        return pairs.astype(np.int64, copy=False)
     cells = np.floor(points / cutoff).astype(np.int64)
     buckets: dict[tuple, list[int]] = {}
     for i, c in enumerate(map(tuple, cells)):
@@ -186,7 +221,24 @@ def _neighbour_pairs(points: np.ndarray, cutoff: float):
 
 
 def _components(n: int, pairs: np.ndarray) -> list[np.ndarray]:
-    """Connected components via union-find with path compression."""
+    """Connected components, as arrays of point indices.
+
+    scipy's csgraph when available; the union-find below otherwise. Both return
+    the same partition -- verified on a 1.27M-point frame -- but the union-find
+    loops over every pair and every point in Python, which is 20s where scipy
+    is 1.2s.
+    """
+    if n == 0:
+        return []
+    if _connected_components is not None:
+        idx = (pairs if pairs.shape[0] else np.empty((0, 2), dtype=np.int64))
+        graph = _coo_matrix((np.ones(idx.shape[0], dtype=np.int8), (idx[:, 0], idx[:, 1])),
+                            shape=(n, n))
+        _, labels = _connected_components(graph, directed=False)
+        order = np.argsort(labels, kind="stable")
+        splits = np.flatnonzero(np.diff(labels[order])) + 1
+        return np.split(order, splits)
+
     parent = np.arange(n)
 
     def find(a):
@@ -295,6 +347,9 @@ def trace_lines(points: np.ndarray, charges: np.ndarray, link_cutoff: float,
                     temporary on top -- i.e. the guard could not fire before
                     the allocation it was guarding against had already
                     failed.
+
+    The wall-clock guard on the WHOLE frame lives in detect_frame(), not here,
+    so this stays a pure function the tests can call directly.
     """
     if close_cutoff is None:
         close_cutoff = link_cutoff
@@ -400,6 +455,23 @@ def detect_frame(psi, engine, t: float, trajectory: int, cfg,
 
     frame = VortexFrame(t=t, trajectory=trajectory, points=points, charges=charges,
                         normals=normals, n_peak=n_peak, integrality_error=err)
+    # Wall-clock guard on the frame as a whole. Linking is host-side, so a
+    # frame with a million singularities stalls the run for minutes with the GPU
+    # idle -- and a million is never a vortex count, it is the Truncated-Wigner
+    # vacuum's speckle passing the density mask. Record the counts, say linking
+    # was skipped, and point at the knob that actually fixes it.
+    max_points = getattr(cfg, "max_pierce_points", None)
+    if max_points is not None and points.shape[0] > max_points:
+        global _LINKING_WARNED
+        frame.linking_skipped = True
+        if not _LINKING_WARNED:
+            _LINKING_WARNED = True
+            print(f"\n[detector] {points.shape[0]:,} pierce points in one frame, over "
+                  f"max_pierce_points={max_points:,} -- skipping line tracing for it; "
+                  f"pierce counts are still recorded. This many singularities is the "
+                  f"Truncated-Wigner vacuum passing the density mask, not vortices. Raise "
+                  f"NUCLEATION_MASK_THRESHOLD until the count at t=0 is near zero.")
+        return frame
     frame.lines = trace_lines(points, charges,
                               link_cutoff=cfg.link_cutoff_dx * engine.dx,
                               close_cutoff=cfg.close_cutoff_dx * engine.dx)

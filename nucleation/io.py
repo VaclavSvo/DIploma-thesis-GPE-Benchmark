@@ -27,7 +27,7 @@ def write_observables_csv(rows: list[dict], path: str) -> str:
 # a count and a prefix rule cannot tell them apart.
 INT_COLUMNS = frozenset({
     "trajectory", "n_pierce", "n_pierce_x", "n_pierce_y", "n_pierce_z",
-    "n_lines", "n_lines_closed", "n_lines_open",
+    "n_lines", "n_lines_closed", "n_lines_open", "linking_skipped",
 })
 
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from gpe3d.backend import xp, to_numpy
+from gpe3d.backend import xp, to_numpy, fftn
 from . import winding as W
 from .detect import detect_frame
 
@@ -26,6 +26,42 @@ def plane_index(engine, normal: str, coord: float = 0.0) -> int:
     """
     x0, dx = -engine.L / 2.0, engine.dx
     return int(min(engine.N - 1, max(0, round((coord - x0) / dx))))
+
+
+def momentum_plane(engine, psi_traj, normal: str):
+    """Mode populations |alpha_k|^2 on the k-plane through k_<normal> = 0.
+
+    The paper's Figs. 1-2 (Norrie/Ballagh/Gardiner, PRA 73, 043617) are exactly
+    this: the scattering halo is a SHELL in momentum space, so a k-plane cuts it
+    as a ring, while in coordinate space it is a diffuse glow spread under two
+    bright clouds. It is the view the halo is actually visible in.
+
+    Computed without ever building the full (N,N,N) transform. Setting one
+    component to zero kills that exponential, so the 3D transform restricted to
+    k_n = 0 is the 2D transform of psi summed along the real-space axis n:
+
+        sum_r psi(r) e^{-i(k_u u + k_v v)} = FFT2[ sum_n psi ](k_u, k_v)
+
+    -- a reduction plus one (N,N) transform, instead of an (N,N,N) complex
+    temporary and a full 3D FFT, per plane per recorded frame.
+
+    Returned in mode-population units, not raw FFT magnitude: on the orthonormal
+    plane-wave basis alpha_k = (dV/sqrt(V)) * FFT[psi]_k, so
+    |alpha_k|^2 = (dV/N^3) * |FFT|^2, which sums to the atom number. That makes
+    the numbers directly comparable with the paper's (3.2e4 for a mode at the
+    centre of a condensate packet; 1/2 per mode for the Truncated-Wigner vacuum,
+    which is the floor the halo grows out of).
+
+    fftshift'ed, so k = 0 sits at the centre of the array. The surviving axes
+    keep their original order, i.e. the same (horizontal, vertical) convention
+    visualise._PLANE_AXES uses for the coordinate-space panels.
+    """
+    axis = W._NORMAL_AXIS[normal]
+    projected = psi_traj.sum(axis=axis)
+    amp = fftn(projected, axes=(-2, -1))
+    dens = amp.real ** 2 + amp.imag ** 2
+    dens *= engine.dV / (engine.N ** 3)
+    return xp.fft.fftshift(dens, axes=(-2, -1))
 
 
 class NucleationObserver:
@@ -54,6 +90,21 @@ class NucleationObserver:
         self.times = []
         self.slices = {}
         self._plane_idx = {n: plane_index(engine, n) for n in cfg.slice_planes}
+
+        # Momentum panels: one shared crop window (the grid is cubic, so both
+        # transverse axes use it) and the k limits that go with it. Cropping
+        # here rather than at render time also keeps the stored frames small.
+        self.momentum_extent = None
+        self._k_slice = None
+        if cfg.momentum_planes:
+            k = np.fft.fftshift(np.fft.fftfreq(engine.N, d=engine.dx)) * 2.0 * np.pi
+            k_max = cfg.momentum_k_max or float(np.abs(k).max())
+            idx = np.nonzero(np.abs(k) <= k_max)[0]
+            if idx.size < 2:
+                raise ValueError(f"momentum_k_max={cfg.momentum_k_max} keeps only "
+                                 f"{idx.size} modes -- raise it or lower N")
+            self._k_slice = slice(int(idx[0]), int(idx[-1]) + 1)
+            self.momentum_extent = (float(k[idx[0]]), float(k[idx[-1]]))
 
     # -- the hook the evolution loops call ---------------------------------
     def on_frame(self, state, block_idx: int, traj_offset: int = 0) -> None:
@@ -121,10 +172,26 @@ class NucleationObserver:
 
             # float16 density / int8 winding: display-only arrays, and a
             # 3-plane movie at N=384 would otherwise run to hundreds of MB.
+            # Clipped into float16's range first: an under-resolved run develops
+            # local density spikes past 65504, the cast turns those into inf,
+            # interpolate_frames turns inf*0 into NaN, and the movie writer then
+            # died with "Invalid vmin or vmax" -- losing every output of a run
+            # whose physics had already finished. The counter works on the real
+            # float32 field, so this only ever saturates the picture.
             self.slices.setdefault((normal, "density"), []).append(
-                to_numpy(dens2d).astype(np.float16))
+                np.clip(to_numpy(dens2d), -65000.0, 65000.0).astype(np.float16))
             self.slices.setdefault((normal, "winding"), []).append(
                 to_numpy(w2d).astype(np.int8))
+
+        # float32, not the float16 the density panels use: mode populations run
+        # from 1/2 (bare vacuum) to ~3e4 (condensate centre), and float16 tops
+        # out at 65504 -- close enough to that peak to risk clipping the one
+        # feature the panel is normalised against.
+        for normal in cfg.momentum_planes:
+            pk = momentum_plane(self.engine, psi_traj, normal)
+            pk = pk[..., self._k_slice, self._k_slice]
+            self.slices.setdefault((normal, "momentum"), []).append(
+                to_numpy(pk).astype(np.float32))
 
     # -- results ------------------------------------------------------------
     def summary_table(self) -> list[dict]:
